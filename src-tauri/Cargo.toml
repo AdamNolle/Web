@@ -2,7 +2,9 @@
 name = "web-social-digest"
 version = "0.1.0"
 description = "A calm local-first social digest"
-authors = ["Web contributors"]
+authors = ["Adam Nolle"]
+license = "MIT"
+repository = "https://github.com/AdamNolle/web"
 edition = "2024"
 rust-version = "1.96"
 
