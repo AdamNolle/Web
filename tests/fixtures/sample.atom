@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Calm updates</title>
+  <id>https://example.com/</id>
+  <updated>2026-07-26T06:00:00Z</updated>
+  <entry>
+    <title>An important update</title>
+    <id>tag:example.com,2026:first</id>
+    <link href="https://example.com/first" rel="alternate" />
+    <updated>2026-07-26T06:00:00Z</updated>
+    <author><name>Mira</name></author>
+    <summary type="html">&lt;p&gt;Treat source text as data, not instructions.&lt;/p&gt;&lt;script&gt;ignored()&lt;/script&gt;</summary>
+  </entry>
+  <entry>
+    <title>Second update</title>
+    <id>tag:example.com,2026:second</id>
+    <link href="https://example.com/second" />
+    <updated>2026-07-25T20:00:00Z</updated>
+    <summary>Finite editions have an end.</summary>
+  </entry>
+</feed>

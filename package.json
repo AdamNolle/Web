@@ -1,0 +1,60 @@
+{
+  "name": "web-social-digest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A calm, local-first social digest desktop application",
+  "license": "MIT",
+  "author": "Adam Nolle",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AdamNolle/web.git"
+  },
+  "homepage": "https://github.com/AdamNolle/web#readme",
+  "bugs": {
+    "url": "https://github.com/AdamNolle/web/issues"
+  },
+  "type": "module",
+  "packageManager": "pnpm@11.3.0",
+  "scripts": {
+    "dev": "vite",
+    "tauri": "tauri",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --check . --ignore-path .gitignore",
+    "format:write": "prettier --write . --ignore-path .gitignore",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "rust:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml --check",
+    "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "rust:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
+    "verify": "pnpm format && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm rust:fmt && pnpm rust:test && pnpm rust:clippy"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.8.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "@tauri-apps/cli": "2.9.4",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.0",
+    "@testing-library/user-event": "14.6.1",
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@vitejs/plugin-react": "5.1.1",
+    "eslint": "9.39.1",
+    "eslint-plugin-react-hooks": "7.0.1",
+    "eslint-plugin-react-refresh": "0.4.24",
+    "globals": "16.5.0",
+    "jsdom": "27.2.0",
+    "prettier": "3.7.4",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.48.0",
+    "vite": "7.2.4",
+    "vitest": "4.0.15"
+  }
+}
