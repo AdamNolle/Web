@@ -226,8 +226,8 @@ describe('calm dashboard', () => {
     const base = createDemoTransport();
     let reads = 0;
     const removedTitle = demoDashboard.items[0]!.title;
-    const retainedOverview = demoDashboard.items[1]!.commentOverview;
-    const refreshedOverview = 'Refreshed bounded comment evidence.';
+    const retainedSummary = demoDashboard.items[1]!.summary;
+    const refreshedSummary = 'Refreshed bounded summary evidence.';
     const updating = new Proxy(base, {
       get(target, property, receiver) {
         if (property === 'getDashboard') {
@@ -242,7 +242,7 @@ describe('calm dashboard', () => {
                 .filter((item) => item.title !== removedTitle)
                 .map((item) =>
                   item.id === demoDashboard.items[1]!.id
-                    ? { ...item, commentOverview: refreshedOverview }
+                    ? { ...item, summary: refreshedSummary }
                     : item,
                 )
                 .reverse();
@@ -258,8 +258,8 @@ describe('calm dashboard', () => {
     await screen.findByRole('heading', { name: 'Good morning.' });
     await screen.findByRole('button', { name: 'Apply new edition' });
     expect(screen.queryByText(removedTitle)).not.toBeInTheDocument();
-    expect(screen.queryByText(retainedOverview)).not.toBeInTheDocument();
-    expect(screen.getByText(refreshedOverview)).toBeInTheDocument();
+    expect(screen.queryByText(retainedSummary)).not.toBeInTheDocument();
+    expect(screen.getByText(refreshedSummary)).toBeInTheDocument();
     expect(screen.queryByText('Pending after retention.')).not.toBeInTheDocument();
   });
 

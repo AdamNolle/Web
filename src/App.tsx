@@ -567,26 +567,7 @@ function DigestCard({
         {item.author} · {item.source}
       </p>
       <h3>{item.title}</h3>
-      <div className="generated-label">
-        {item.summaryMethod === 'model'
-          ? `Locally generated · ${item.summaryProvider}`
-          : item.summaryMethod === 'extractive'
-            ? 'Extractive local fallback'
-            : 'Demonstration fixture'}
-      </div>
       <p className="summary">{item.summary}</p>
-      <div className="comment-overview">
-        <strong>
-          Conversation overview ·{' '}
-          {item.summaryMethod === 'model'
-            ? 'locally generated'
-            : item.summaryMethod === 'extractive'
-              ? 'extractive fallback'
-              : 'demonstration fixture'}
-        </strong>
-        <p>{item.commentOverview}</p>
-        {item.summaryUncertainty && <small>{item.summaryUncertainty}</small>}
-      </div>
       <p className="why">
         <span aria-hidden="true">◎</span> {item.reason}
       </p>
@@ -601,6 +582,14 @@ function DigestCard({
       </button>
       {expanded && (
         <div className="evidence" id={evidenceId}>
+          <p className="provenance-note">
+            {item.summaryMethod === 'model'
+              ? `Summary generated locally · ${item.summaryProvider}`
+              : item.summaryMethod === 'extractive'
+                ? 'Summary produced by the deterministic local fallback (no model installed)'
+                : 'Demonstration fixture — not a real fetched source'}
+            {item.summaryUncertainty ? ` · ${item.summaryUncertainty}` : ''}
+          </p>
           {item.evidence.map((evidence, index) => (
             <blockquote key={`${evidence.source}-${evidence.publishedAt}-${index}`}>
               <p>“{evidence.excerpt}”</p>

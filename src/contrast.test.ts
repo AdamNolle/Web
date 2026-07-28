@@ -18,29 +18,26 @@ const contrast = (first: string, second: string) => {
 describe('declared non-text contrast tokens', () => {
   it('keeps actual light and dark input/focus surface pairs above 3:1', () => {
     const pairs = [
-      ['#747970', '#fffef9'],
-      ['#8d958c', '#2a2d29'],
-      ['#1f6043', '#eeece4'],
-      ['#a8efbd', '#252824'],
-      ['#ffffff', '#252824'],
-      ['#a8efbd', '#252824'],
-      ['#747970', '#fbfaf6'],
-      ['#8d958c', '#222522'],
+      // light theme: input/control borders against their surfaces
+      ['#85858d', '#ffffff'],
+      ['#85858d', '#f4f4f5'],
+      // dark theme: input/control borders against their surfaces
+      ['#8d8d95', '#18181b'],
       // brand mark: white disc on the purple square, and the square on each sidebar
       ['#ffffff', '#5b21b6'],
-      ['#5b21b6', '#eeece4'],
+      ['#5b21b6', '#f4f4f5'],
       ['#ffffff', '#8b5cf6'],
-      ['#8b5cf6', '#1c1f1c'],
+      ['#8b5cf6', '#18181b'],
     ] as const;
     for (const [foreground, surface] of pairs) {
       expect(contrast(foreground, surface)).toBeGreaterThanOrEqual(3);
     }
-    expect(css).toContain('--input-bg: #fffef9');
-    expect(css).toContain('--input-border: #747970');
-    expect(css).toContain('--input-bg: #2a2d29');
-    expect(css).toContain('--input-border: #8d958c');
-    expect(css).toContain('--control-border: #747970');
-    expect(css).toContain('--control-border: #8d958c');
+    expect(css).toContain('--input-bg: #ffffff');
+    expect(css).toContain('--input-border: #85858d');
+    expect(css).toContain('--input-bg: #1f1f23');
+    expect(css).toContain('--input-border: #8d8d95');
+    expect(css).toContain('--control-border: #85858d');
+    expect(css).toContain('--control-border: #8d8d95');
     expect(css).toContain('--brand-fill: #5b21b6');
     expect(css).toContain('--brand-border: #000000');
     expect(css).toContain('--brand-disc: #ffffff');
@@ -48,15 +45,33 @@ describe('declared non-text contrast tokens', () => {
     expect(css).toMatch(
       /\.brand-mark \{[\s\S]*background: var\(--brand-fill\)[\s\S]*\.brand-mark::after \{[\s\S]*background: var\(--brand-disc\)/,
     );
-    expect(contrast('#404740', '#fbfaf6')).toBeGreaterThanOrEqual(4.5);
-    expect(contrast('#e0e3de', '#222522')).toBeGreaterThanOrEqual(4.5);
+    // body text pairs (4.5:1 — small text, both themes)
+    expect(contrast('#3f3f46', '#ffffff')).toBeGreaterThanOrEqual(4.5);
+    expect(contrast('#d4d4d8', '#18181b')).toBeGreaterThanOrEqual(4.5);
+    expect(contrast('#71717a', '#ffffff')).toBeGreaterThanOrEqual(4.5);
+    expect(contrast('#a1a1aa', '#18181b')).toBeGreaterThanOrEqual(4.5);
+    // accent text pairs (used for eyebrow/why/topic-badge/links)
+    expect(contrast('#5b21b6', '#ffffff')).toBeGreaterThanOrEqual(4.5);
+    expect(contrast('#a78bfa', '#18181b')).toBeGreaterThanOrEqual(4.5);
+    expect(contrast('#4c1d95', '#ede9fe')).toBeGreaterThanOrEqual(4.5);
+    expect(contrast('#ddd6fe', '#3b2f63')).toBeGreaterThanOrEqual(4.5);
+    // danger text pairs
+    expect(contrast('#b91c1c', '#ffffff')).toBeGreaterThanOrEqual(4.5);
+    expect(contrast('#fca5a5', '#18181b')).toBeGreaterThanOrEqual(4.5);
     expect(css).toMatch(
-      /\.secondary[\s\S]*border: 1px solid var\(--control-border\)[\s\S]*color: var\(--control-text\)/,
+      /\.secondary[\s\S]*border: 1px solid var\(--glass-border\)[\s\S]*background: var\(--glass-bg\)/,
     );
     expect(css).toMatch(/\.add-source input[\s\S]*background: var\(--input-bg\)/);
     expect(css).toMatch(/\.quiet-hours[\s\S]*border: 1px solid var\(--input-border\)/);
     expect(css).toMatch(
       /\.save-bar button:focus-visible,[\s\S]*outline-color: var\(--focus-on-dark\)/,
     );
+  });
+
+  it('no longer relies on the retired earthy/serif tokens', () => {
+    expect(css).not.toMatch(/--ochre/);
+    expect(css).not.toMatch(/--green\b/);
+    expect(css).not.toMatch(/Newsreader/);
+    expect(css).not.toMatch(/#f3f1ea|#fbfaf6|#eeece4|#f0eee7|#ae7441/i);
   });
 });
