@@ -1,8 +1,10 @@
 pub mod capabilities;
+pub mod clustering;
 pub mod connectors;
 pub mod db;
 pub mod domain;
 pub mod inference;
+pub mod ranking;
 pub mod redaction;
 pub mod scheduler;
 pub mod secrets;
@@ -36,7 +38,22 @@ use secrets::{OsSecretStore, SecretStore};
 use tauri::{Manager, State};
 
 const OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
-const MAX_MODEL_ITEMS_PER_BATCH: usize = 4;
+// Whole-run model-summarization budget. Bounded by the existing envelope this
+// runner already promises: MAX_SOURCES_PER_RUN (20) sources at the RSS
+// transport's worst-case REQUEST_TIMEOUT (15s, connectors/rss.rs) can consume
+// up to 20*15s = 300s of the RUNNER_DEADLINE's 480s (8 minutes) before any
+// model call happens. Each model item costs at most one OllamaProvider
+// generation call at its default 30s timeout (inference.rs). The remaining
+// 480s - 300s = 180s headroom therefore allows at most floor(180/30) = 6
+// model items per whole run without risking the existing 8-minute deadline
+// even in the pathological case where every source's fetch times out before
+// any model call starts. Raised from the previous placeholder of 4, which
+// left most 8-item editions mostly extractive with no headroom analysis.
+const MAX_MODEL_ITEMS_PER_BATCH: usize = 6;
+// "Finite by design" is a core product invariant: this compiles into a build
+// failure (not just a test) if the cap is ever widened past a small hard
+// bound or made unlimited.
+const _: () = assert!(MAX_MODEL_ITEMS_PER_BATCH > 0 && MAX_MODEL_ITEMS_PER_BATCH <= 10);
 const MAX_SOURCES_PER_RUN: usize = 20;
 const RUNNER_LEASE_MS: i64 = 10 * 60 * 1_000;
 const RUNNER_DEADLINE: Duration = Duration::from_secs(8 * 60);
@@ -1364,5 +1381,23 @@ mod runtime_tests {
         let bounded_source_ms = (4 * 15 + 4 * 30) * 1_000;
         assert!(bounded_source_ms < RUNNER_LEASE_MS);
         assert!(RUNNER_DEADLINE.as_millis() < RUNNER_LEASE_MS as u128);
+    }
+
+    #[test]
+    fn model_item_budget_cannot_exceed_the_runner_deadline_envelope() {
+        // Mirrors the arithmetic justified in the MAX_MODEL_ITEMS_PER_BATCH doc
+        // comment: MAX_SOURCES_PER_RUN sources each worst-casing the RSS
+        // transport's REQUEST_TIMEOUT (15s, connectors/rss.rs) before any model
+        // call happens, plus MAX_MODEL_ITEMS_PER_BATCH model attempts at
+        // OllamaProvider's default per-item timeout (30s, inference.rs), must
+        // never exceed RUNNER_DEADLINE. This is a regression test: if either
+        // constant changes without re-deriving this budget, it fails loudly
+        // instead of silently risking the 8-minute whole-run envelope.
+        const RSS_REQUEST_TIMEOUT_SECS: u64 = 15;
+        const MODEL_ITEM_TIMEOUT_SECS: u64 = 30;
+        let worst_case_ms = (MAX_SOURCES_PER_RUN as u64 * RSS_REQUEST_TIMEOUT_SECS
+            + MAX_MODEL_ITEMS_PER_BATCH as u64 * MODEL_ITEM_TIMEOUT_SECS)
+            * 1_000;
+        assert!(worst_case_ms <= RUNNER_DEADLINE.as_millis() as u64);
     }
 }

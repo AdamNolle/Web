@@ -236,6 +236,7 @@ export const demoDashboard: Dashboard = {
     localOnly: true,
     feedbackCount: 0,
     selectedModel: '',
+    rankingPaused: false,
   },
   model: {
     provider: 'Ollama-compatible',

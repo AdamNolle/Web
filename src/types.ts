@@ -74,6 +74,7 @@ export const SettingsSchema = z.object({
     .string()
     .max(200)
     .regex(/^$|^[A-Za-z0-9._:/-]+$/),
+  rankingPaused: z.boolean(),
 });
 
 export const ModelStateSchema = z.enum([

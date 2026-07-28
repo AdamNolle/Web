@@ -48,15 +48,16 @@ architecture below has been through twelve independent rounds of adversarial
 security/correctness/UX review; see [`REMAINING-WORK.md`](REMAINING-WORK.md)
 for a from-scratch audit of what's real vs. aspirational.
 
-| Area                        | Status                                                                                                                                                        |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| RSS/Atom sources            | **Live.** SSRF-hardened fetch (DNS pinning, private/link-local/reserved-range rejection, redirect re-validation, HTTPS-only), conditional resync, retention.  |
-| Local summarization         | **Live.** Loopback-only Ollama integration with schema-validated structured output, exact model-digest attestation, and a deterministic no-model fallback.    |
-| Persistence                 | **Live.** Rust-owned SQLite, transactional version-gated migrations, WAL, foreign keys, generation-fenced deletion, privacy-epoch invalidation.               |
-| Credentials                 | **Live.** OS vault only (Windows Credential Manager / macOS Keychain / Linux Secret Service), fail-closed, no plaintext fallback.                             |
-| Scheduling                  | **Partial.** Runs only while the app window is open; no tray/background execution yet.                                                                        |
-| Trends & ranking            | **Not active in production.** The data model exists; real clustering/ranking is on the roadmap.                                                               |
-| Mastodon / Bluesky / Reddit | **Not active.** Provider-neutral connector plumbing exists; live OAuth connectors are gated on policy/infrastructure review — tracked in `REMAINING-WORK.md`. |
+| Area                        | Status                                                                                                                                                                                                                                                     |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RSS/Atom sources            | **Live.** SSRF-hardened fetch (DNS pinning, private/link-local/reserved-range rejection, redirect re-validation, HTTPS-only), conditional resync, retention.                                                                                               |
+| Local summarization         | **Live.** Loopback-only Ollama integration with schema-validated structured output, exact model-digest attestation, and a deterministic no-model fallback.                                                                                                 |
+| Persistence                 | **Live.** Rust-owned SQLite, transactional version-gated migrations, WAL, foreign keys, generation-fenced deletion, privacy-epoch invalidation.                                                                                                            |
+| Credentials                 | **Live.** OS vault only (Windows Credential Manager / macOS Keychain / Linux Secret Service), fail-closed, no plaintext fallback.                                                                                                                          |
+| Scheduling                  | **Partial.** Runs only while the app window is open; no tray/background execution yet.                                                                                                                                                                     |
+| Ranking                     | **Live, bounded.** Explicit-feedback-only (More/Less), per-source, gated by a minimum-signal threshold, with a 25% chronological/diversity reserve and a per-item why-shown reason; pausable in Settings. No passive/behavioral signals exist or are read. |
+| Trends                      | **Live, bounded.** Deterministic lexical clustering runs as part of every digest: cross-source gate (a single source repeating itself is never a trend), same-source dedup collapse, deterministic fallback label. No model decides membership.            |
+| Mastodon / Bluesky / Reddit | **Not active.** Provider-neutral connector plumbing exists; live OAuth connectors are gated on policy/infrastructure review — tracked in `REMAINING-WORK.md`.                                                                                              |
 
 ## Architecture
 

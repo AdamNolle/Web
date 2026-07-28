@@ -128,6 +128,14 @@ pub struct Settings {
     pub feedback_count: i64,
     #[serde(default)]
     pub selected_model: String,
+    /// When true, disables learned ranking entirely: every digest item is
+    /// ordered purely chronologically and labeled accordingly, regardless of
+    /// accumulated feedback. `#[serde(default)]` so settings JSON persisted
+    /// before this field existed deserializes to `false` (learned ranking
+    /// active), matching the existing round-trip pattern used by
+    /// `selected_model`.
+    #[serde(default)]
+    pub ranking_paused: bool,
 }
 
 impl Default for Settings {
@@ -142,6 +150,7 @@ impl Default for Settings {
             local_only: true,
             feedback_count: 0,
             selected_model: String::new(),
+            ranking_paused: false,
         }
     }
 }

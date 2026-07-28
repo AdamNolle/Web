@@ -658,8 +658,9 @@ function DigestCard({
           Mute source
         </button>
         <small>
-          More/Less are saved for future ranking, which is not active. Not relevant removes this
-          item now; Mute source removes this source’s items now.
+          More/Less bias future ranking for this source once it has enough signals; see Privacy
+          &amp; settings for how. Not relevant removes this item now; Mute source removes this
+          source’s items now.
         </small>
       </div>
     </article>
@@ -672,7 +673,7 @@ function Trends({ dashboard }: { dashboard: Dashboard }) {
       <PageHeader
         eyebrow="Across independent sources"
         title="Trends, without the hype."
-        detail="Production clustering is not active yet. Browser-preview clusters are labeled demonstrations only."
+        detail="Deterministic lexical clustering groups posts that share enough overlapping significant terms, requires more than one distinct source, and collapses near-duplicate reposts to one representative before anything is shown. No model ever decides membership."
       />
       <div className="trend-list">
         {dashboard.trends.length === 0 && (
@@ -705,8 +706,11 @@ function Trends({ dashboard }: { dashboard: Dashboard }) {
         ))}
       </div>
       <p className="disclosure">
-        Fixture clusters demonstrate the calm evidence interface only. Real editions publish no
-        trend until deterministic cross-source clustering and its evaluation suite are enabled.
+        Trends are produced by deterministic lexical clustering during digest preparation, gated by
+        a cross-source requirement and a same-source dedup collapse. Membership is decided by that
+        fixed logic alone; labels shown here are a deterministic fallback (the shared significant
+        terms), not model-written. Muting or marking a member post not relevant hides its whole
+        derived trend immediately.
       </p>
     </>
   );
@@ -1238,21 +1242,39 @@ function SettingsView({
             <li>Loopback endpoint with proxy bypass</li>
             <li>No cloud fallback or automatic model download</li>
             <li>
-              At most four new items per sync batch use the ready selected model; every failure
-              falls back extractively
+              At most six new items per whole sync use the ready selected model; every failure falls
+              back extractively
             </li>
           </ul>
         </article>
         <article className="settings-panel">
           <h2>How importance works</h2>
           <p>
-            Web stores only feedback you deliberately provide. Learned ranking is not active yet,
-            and Web does not collect dwell time, scrolling, opens, or notification clicks.
+            Web stores only feedback you deliberately provide. More/Less adjust a bounded per-source
+            weight once that source has at least 3 active signals; below that threshold, ranking
+            stays chronological. At least a quarter of every edition&rsquo;s slots are always
+            chronological, immune to that weighting. Each item&rsquo;s &ldquo;why shown&rdquo; note
+            names the exact reason. Web does not collect dwell time, scrolling, opens, or
+            notification clicks.
           </p>
           <p>
             <strong>{dashboard.settings.feedbackCount}</strong> explicit feedback signals stored
             locally.
           </p>
+          <label className="toggle-row">
+            <span>
+              <strong>Pause learned ranking</strong>
+              <small>
+                When on, every edition is ordered purely by publish time regardless of stored
+                feedback
+              </small>
+            </span>
+            <input
+              type="checkbox"
+              checked={settings.rankingPaused}
+              onChange={(event) => update('rankingPaused', event.target.checked)}
+            />
+          </label>
           <button
             className="secondary"
             type="button"

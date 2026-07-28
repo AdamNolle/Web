@@ -439,6 +439,7 @@ impl Database {
         {
             return Ok(());
         }
+        let ranking_paused = self.load_settings().unwrap_or_default().ranking_paused;
         let transaction = self
             .connection
             .transaction()
@@ -457,26 +458,37 @@ impl Database {
         ).map_err(|_| AppError::internal())?;
         {
             let mut statement = transaction.prepare(
-                "SELECT id FROM (
-                    SELECT p.id, p.published_at,
+                "SELECT id, source_id FROM (
+                    SELECT p.id, p.source_id, p.published_at,
                            ROW_NUMBER() OVER (PARTITION BY p.source_id ORDER BY p.published_at DESC, p.id) AS source_rank
                     FROM posts p WHERE p.deleted_at IS NULL
                     AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.post_id=p.id AND f.signal='not_relevant' AND f.retracted_at IS NULL)
                     AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.source_id=p.source_id AND f.signal='mute_source' AND f.retracted_at IS NULL)
                  ) WHERE source_rank <= 2 ORDER BY published_at DESC, id LIMIT 8"
             ).map_err(|_| AppError::internal())?;
-            let post_ids = statement
-                .query_map([], |row| row.get::<_, String>(0))
+            let candidates = statement
+                .query_map([], |row| {
+                    Ok(crate::ranking::CandidatePost {
+                        post_id: row.get::<_, String>(0)?,
+                        source_id: row.get::<_, String>(1)?,
+                    })
+                })
                 .map_err(|_| AppError::internal())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| AppError::internal())?;
-            for (index, post_id) in post_ids.iter().enumerate() {
+            let feedback_stats =
+                source_feedback_stats(&transaction).map_err(|_| AppError::internal())?;
+            for item in
+                crate::ranking::rank_candidates(&candidates, &feedback_stats, ranking_paused)
+            {
                 transaction.execute(
-                    "INSERT INTO digest_items(digest_id, post_id, rank, reason, topic, importance) VALUES(?1, ?2, ?3, 'Recent · source-balanced baseline', 'Your sources', ?4)",
-                    params![digest_id, post_id, i64::try_from(index + 1).unwrap_or(8), 0.8_f64 - (index as f64 * 0.04)],
+                    "INSERT INTO digest_items(digest_id, post_id, rank, reason, topic, importance) VALUES(?1, ?2, ?3, ?4, 'Your sources', ?5)",
+                    params![digest_id, item.post_id, item.rank, item.reason, item.importance],
                 ).map_err(|_| AppError::internal())?;
             }
         }
+        generate_trend_clusters(&transaction, &digest_id, now_ms)
+            .map_err(|_| AppError::internal())?;
         transaction.execute(
             "UPDATE jobs SET state='complete', message='Fresh edition prepared', updated_at=?1 WHERE dedupe_key=?2",
             params![now_ms, dedupe_key],
@@ -1588,6 +1600,105 @@ impl Database {
     }
 }
 
+/// Aggregates active (non-retracted) `more_like_this`/`less_like_this` feedback
+/// per source for the deterministic ranking in `run_digest_fenced`.
+/// `not_relevant` and `mute_source` are intentionally excluded here: they
+/// already remove posts/sources from the candidate set entirely via the
+/// `NOT EXISTS` filters in the selection query, so counting them again as a
+/// ranking bias would double-count the same explicit signal.
+fn source_feedback_stats(
+    transaction: &Transaction<'_>,
+) -> rusqlite::Result<HashMap<String, crate::ranking::SourceFeedbackStats>> {
+    let mut statement = transaction.prepare(
+        "SELECT source_id, signal, COUNT(*) FROM feedback
+         WHERE retracted_at IS NULL AND source_id IS NOT NULL
+           AND signal IN ('more_like_this', 'less_like_this')
+         GROUP BY source_id, signal",
+    )?;
+    let mut stats: HashMap<String, crate::ranking::SourceFeedbackStats> = HashMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (source_id, signal, count) = row?;
+        let entry = stats.entry(source_id).or_default();
+        if signal == "more_like_this" {
+            entry.more_count = count;
+        } else {
+            entry.less_count = count;
+        }
+    }
+    Ok(stats)
+}
+
+/// Runs the deterministic lexical clustering pass (see `clustering.rs`) over
+/// a bounded pool of non-deleted, non-hidden posts and persists any
+/// validated (cross-source, dedup-collapsed) clusters as `trend_clusters` /
+/// `trend_members` rows for `digest_id`. This is the only place trend
+/// clusters are written outside of test fixtures; membership comes entirely
+/// from `clustering::build_clusters` and is never decided here or by a
+/// model. At most 5 clusters are kept, matching `load_trends`'s display cap,
+/// preferring the most cross-source-validated ones.
+fn generate_trend_clusters(
+    transaction: &Transaction<'_>,
+    digest_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT p.id, p.source_id, p.title, p.body_text, p.published_at FROM posts p
+             WHERE p.deleted_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.post_id=p.id AND f.signal='not_relevant' AND f.retracted_at IS NULL)
+             AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.source_id=p.source_id AND f.signal='mute_source' AND f.retracted_at IS NULL)
+             ORDER BY p.published_at DESC LIMIT 60",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(crate::clustering::ClusterCandidate {
+                    post_id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
+                    published_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for cluster in crate::clustering::build_clusters(&candidates)
+        .into_iter()
+        .take(5)
+    {
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let summary = if cluster.shared_terms.is_empty() {
+            format!(
+                "{} independent sources referenced overlapping coverage.",
+                cluster.source_count
+            )
+        } else {
+            format!(
+                "{} independent sources referenced: {}.",
+                cluster.source_count,
+                cluster.shared_terms.join(", ")
+            )
+        };
+        transaction.execute(
+            "INSERT INTO trend_clusters(id, digest_id, label, summary, confidence, created_at, cluster_method) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'lexical')",
+            params![cluster_id, digest_id, cluster.label, summary, cluster.confidence, now_ms],
+        )?;
+        for post_id in &cluster.member_post_ids {
+            transaction.execute(
+                "INSERT INTO trend_members(cluster_id, post_id) VALUES(?1, ?2)",
+                params![cluster_id, post_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn assert_runner_authority_connection(
     connection: &Connection,
     lease: &RunnerLease,
@@ -2571,6 +2682,543 @@ mod tests {
              SELECT ?1, ?2, 'Current evidence.', 'No comments.', json_array(?2), 'deterministic-fallback', 'extractive-v1', content_hash, ?3, 'extractive', 'Fallback.' FROM posts WHERE id=?2",
             params![format!("summary-{post_id}"), post_id, now],
         ).expect("summary");
+    }
+
+    /// Like `seed_post`, but places the source (created once per distinct
+    /// `source_id`, subsequent calls reuse it) and post at an explicit
+    /// `published_at` so ranking tests can control chronological order across
+    /// multiple posts per source.
+    fn seed_post_with_time(
+        database: &mut Database,
+        source_id: &str,
+        post_id: &str,
+        published_at: i64,
+    ) {
+        let now = Utc::now().timestamp_millis();
+        database.connection.execute(
+            "INSERT OR IGNORE INTO sources(id, connector_kind, account_label, detail, status, config_json, created_at, updated_at)
+             VALUES(?1, 'rss', ?1, 'test', 'healthy', '{}', ?2, ?2)",
+            params![source_id, now],
+        ).expect("source");
+        let hash = content_hash(&format!("Test item\nCurrent evidence.\n{post_id}"));
+        database.connection.execute(
+            "INSERT INTO posts(id, source_id, remote_id, canonical_url, canonical_http_url, title, body_text, published_at, published_time_kind, fetched_at, content_hash)
+             VALUES(?1, ?2, ?1, 'https://example.test/item', 'https://example.test/item', 'Test item', 'Current evidence.', ?3, 'published', ?4, ?5)",
+            params![post_id, source_id, published_at, now, hash],
+        ).expect("post");
+        database.connection.execute(
+            "INSERT INTO summaries(id, post_id, summary_text, comment_overview, provenance_json, provider, prompt_version, input_hash, created_at, summary_method, uncertainty)
+             VALUES(?1, ?2, 'Current evidence.', 'No comments.', '[]', 'deterministic-fallback', 'extractive-v1', ?3, ?4, 'extractive', 'Fallback.')",
+            params![format!("summary-{post_id}"), post_id, hash, now],
+        ).expect("summary");
+    }
+
+    /// Seeds four posts across two sources at descending timestamps
+    /// (`neutral-1` newest, `bias-2` oldest) and records 3 active
+    /// `more_like_this` signals on `source-bias` (clearing
+    /// `MIN_FEEDBACK_FOR_BIAS`). Returns nothing; callers run the digest and
+    /// inspect `digest_items` / `dashboard()`.
+    fn seed_gate_and_reserve_fixture(database: &mut Database) {
+        let now = Utc::now().timestamp_millis();
+        seed_post_with_time(database, "source-neutral", "neutral-1", now);
+        seed_post_with_time(database, "source-bias", "bias-1", now - 1_000);
+        seed_post_with_time(database, "source-neutral", "neutral-2", now - 2_000);
+        seed_post_with_time(database, "source-bias", "bias-2", now - 3_000);
+        for request_id in ["gate-fb-1", "gate-fb-2", "gate-fb-3"] {
+            database
+                .record_feedback(request_id, "bias-1", &FeedbackSignal::MoreLikeThis)
+                .expect("feedback");
+        }
+    }
+
+    /// Like `seed_post_with_time`, but with caller-chosen title/body so
+    /// clustering tests can control which posts share significant terms.
+    fn seed_post_with_content(
+        database: &mut Database,
+        source_id: &str,
+        post_id: &str,
+        title: &str,
+        body: &str,
+        published_at: i64,
+    ) {
+        let now = Utc::now().timestamp_millis();
+        database.connection.execute(
+            "INSERT OR IGNORE INTO sources(id, connector_kind, account_label, detail, status, config_json, created_at, updated_at)
+             VALUES(?1, 'rss', ?1, 'test', 'healthy', '{}', ?2, ?2)",
+            params![source_id, now],
+        ).expect("source");
+        let hash = content_hash(&format!("{title}\n{body}\n{post_id}"));
+        database.connection.execute(
+            "INSERT INTO posts(id, source_id, remote_id, canonical_url, canonical_http_url, title, body_text, published_at, published_time_kind, fetched_at, content_hash)
+             VALUES(?1, ?2, ?1, 'https://example.test/item', 'https://example.test/item', ?3, ?4, ?5, 'published', ?6, ?7)",
+            params![post_id, source_id, title, body, published_at, now, hash],
+        ).expect("post");
+        database.connection.execute(
+            "INSERT INTO summaries(id, post_id, summary_text, comment_overview, provenance_json, provider, prompt_version, input_hash, created_at, summary_method, uncertainty)
+             VALUES(?1, ?2, ?3, 'No comments.', '[]', 'deterministic-fallback', 'extractive-v1', ?4, ?5, 'extractive', 'Fallback.')",
+            params![format!("summary-{post_id}"), post_id, body, hash, now],
+        ).expect("summary");
+    }
+
+    /// All (cluster_id, label, confidence, cluster_method, sorted member post
+    /// ids) rows currently in `trend_clusters`, across every digest -- used
+    /// by clustering tests that need to inspect persisted state directly
+    /// rather than only the latest edition's `dashboard()` view.
+    fn all_trend_cluster_rows(
+        database: &Database,
+    ) -> Vec<(String, String, String, String, Vec<String>)> {
+        let mut statement = database
+            .connection
+            .prepare(
+                "SELECT t.id, t.label, t.confidence, t.cluster_method, GROUP_CONCAT(tm.post_id)
+                 FROM trend_clusters t JOIN trend_members tm ON tm.cluster_id=t.id
+                 GROUP BY t.id ORDER BY t.label, t.id",
+            )
+            .expect("prepare");
+        statement
+            .query_map([], |row| {
+                let ids: String = row.get(4)?;
+                let mut member_ids: Vec<String> = ids.split(',').map(ToOwned::to_owned).collect();
+                member_ids.sort();
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    member_ids,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+    }
+
+    fn digest_item_rows(database: &Database) -> Vec<(String, String, i64)> {
+        database
+            .connection
+            .prepare("SELECT post_id, reason, rank FROM digest_items ORDER BY rank")
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+    }
+
+    #[test]
+    fn below_threshold_source_stays_chronological_in_a_real_digest() {
+        // Same fixture as the gated-bias test below, but with only 2 active
+        // signals recorded (below MIN_FEEDBACK_FOR_BIAS=3): source-bias must
+        // stay neutral and the edition must stay in pure chronological order.
+        let mut database = Database::memory().expect("database");
+        let now = Utc::now().timestamp_millis();
+        seed_post_with_time(&mut database, "source-neutral", "neutral-1", now);
+        seed_post_with_time(&mut database, "source-bias", "bias-1", now - 1_000);
+        seed_post_with_time(&mut database, "source-neutral", "neutral-2", now - 2_000);
+        seed_post_with_time(&mut database, "source-bias", "bias-2", now - 3_000);
+        for request_id in ["gate-fb-1", "gate-fb-2"] {
+            database
+                .record_feedback(request_id, "bias-1", &FeedbackSignal::MoreLikeThis)
+                .expect("feedback");
+        }
+
+        database.run_digest("digest-below-gate").expect("digest");
+
+        let rows = digest_item_rows(&database);
+        assert_eq!(
+            rows.iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["neutral-1", "bias-1", "neutral-2", "bias-2"]
+        );
+        let bias_1 = rows.iter().find(|(id, _, _)| id == "bias-1").unwrap();
+        assert_eq!(
+            bias_1.1,
+            crate::ranking::RankingReason::InsufficientData.text()
+        );
+    }
+
+    #[test]
+    fn gated_bias_reorders_the_edition_with_reserve_immune_to_it() {
+        let mut database = Database::memory().expect("database");
+        seed_gate_and_reserve_fixture(&mut database);
+
+        database.run_digest("digest-gated-bias").expect("digest");
+
+        let rows = digest_item_rows(&database);
+        // Reserve = ceil(4*0.25) = 1: only the oldest item ("bias-2") is
+        // reserved. The learned zone (the other three, by original
+        // chronological index 0,1,2) is re-sorted by bounded score, so
+        // "bias-1" (source-bias, gate cleared, net +1.0 ratio) jumps ahead of
+        // the chronologically-earlier "neutral-1" and "neutral-2".
+        assert_eq!(
+            rows.iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bias-1", "neutral-1", "neutral-2", "bias-2"]
+        );
+        assert_eq!(
+            rows.iter().map(|(_, _, rank)| *rank).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        let reason = |id: &str| {
+            rows.iter()
+                .find(|(row_id, _, _)| row_id == id)
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(
+            reason("bias-1"),
+            crate::ranking::RankingReason::LearnedHigher.text()
+        );
+        assert_eq!(
+            reason("neutral-1"),
+            crate::ranking::RankingReason::InsufficientData.text()
+        );
+        assert_eq!(
+            reason("neutral-2"),
+            crate::ranking::RankingReason::InsufficientData.text()
+        );
+        // "bias-2" is on the very same biased source as "bias-1" yet stays in
+        // its original chronological slot with the reserve reason: the
+        // reserve is immune to learned bias even from its own source.
+        assert_eq!(
+            reason("bias-2"),
+            crate::ranking::RankingReason::ChronologicalReserve.text()
+        );
+    }
+
+    #[test]
+    fn ranking_paused_setting_forces_pure_chronological_order_in_a_real_digest() {
+        let mut database = Database::memory().expect("database");
+        seed_gate_and_reserve_fixture(&mut database);
+        let mut settings = database.settings().expect("settings");
+        assert!(!settings.ranking_paused, "ranking must default to active");
+        settings.ranking_paused = true;
+        database
+            .update_settings("pause-ranking", &settings)
+            .expect("update settings");
+
+        database.run_digest("digest-paused").expect("digest");
+
+        let rows = digest_item_rows(&database);
+        assert_eq!(
+            rows.iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["neutral-1", "bias-1", "neutral-2", "bias-2"],
+            "pausing must fall back to pure chronological order even with a heavily biased source"
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, reason, _)| reason == crate::ranking::RankingReason::Paused.text())
+        );
+    }
+
+    #[test]
+    fn reset_learning_zeros_feedback_and_reverts_a_later_digest_to_neutral() {
+        let mut database = Database::memory().expect("database");
+        seed_gate_and_reserve_fixture(&mut database);
+
+        database.run_digest("digest-before-reset").expect("digest");
+        let before = digest_item_rows(&database);
+        let before_reason = before
+            .iter()
+            .find(|(id, _, _)| id == "bias-1")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            before_reason,
+            crate::ranking::RankingReason::LearnedHigher.text()
+        );
+
+        database.reset_learning("reset-learning-1").expect("reset");
+        let feedback_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM feedback", [], |row| row.get(0))
+            .expect("feedback count");
+        assert_eq!(feedback_count, 0);
+        assert_eq!(
+            database
+                .dashboard(model(), host())
+                .expect("dashboard")
+                .settings
+                .feedback_count,
+            0,
+            "reset must zero the live feedback count that drives ranking"
+        );
+
+        database.run_digest("digest-after-reset").expect("digest");
+        let after_items = database
+            .dashboard(model(), host())
+            .expect("dashboard")
+            .items;
+        let after_reason = after_items
+            .iter()
+            .find(|item| item.id == "bias-1")
+            .expect("bias-1 present")
+            .reason
+            .clone();
+        assert_eq!(
+            after_reason,
+            crate::ranking::RankingReason::InsufficientData.text(),
+            "after reset, the previously-biased source must rank neutrally again"
+        );
+    }
+
+    #[test]
+    fn real_digest_preparation_populates_trend_clusters_not_only_test_fixtures() {
+        // Concrete before/after: trend_clusters is genuinely empty prior to
+        // running a real digest, and is populated by run_digest itself (not
+        // by any test-only seeding helper), proving trend generation runs as
+        // part of production digest preparation.
+        let mut database = Database::memory().expect("database");
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a1",
+            "Senate advances election reform bill",
+            "Lawmakers debated election reform provisions extensively.",
+            1_000,
+        );
+        seed_post_with_content(
+            &mut database,
+            "source-b",
+            "b1",
+            "Election reform bill clears Senate committee",
+            "The election reform legislation advanced after a lengthy committee session.",
+            900,
+        );
+        let before: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM trend_clusters", [], |row| row.get(0))
+            .expect("before count");
+        assert_eq!(
+            before, 0,
+            "no trend clusters must exist before any digest runs"
+        );
+
+        database
+            .run_digest("digest-trends-before-after")
+            .expect("digest");
+
+        let after: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM trend_clusters", [], |row| row.get(0))
+            .expect("after count");
+        assert_eq!(
+            after, 1,
+            "running a real digest must itself populate trend_clusters"
+        );
+        let dashboard = database.dashboard(model(), host()).expect("dashboard");
+        assert_eq!(dashboard.trends.len(), 1);
+        assert_eq!(dashboard.trends[0].method, TrendMethod::Lexical);
+        assert_eq!(dashboard.trends[0].source_count, 2);
+    }
+
+    #[test]
+    fn cross_source_gate_rejects_a_single_source_repeating_itself_in_a_real_digest() {
+        let mut database = Database::memory().expect("database");
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a1",
+            "Senate advances election reform bill",
+            "Lawmakers debated election reform provisions extensively.",
+            1_000,
+        );
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a2",
+            "Senate committee reviews election reform details",
+            "The committee reviewed election reform provisions again this afternoon.",
+            900,
+        );
+
+        database.run_digest("digest-single-source").expect("digest");
+
+        assert!(
+            database
+                .dashboard(model(), host())
+                .expect("dashboard")
+                .trends
+                .is_empty(),
+            "one source repeating itself must never produce a trend"
+        );
+    }
+
+    #[test]
+    fn dedup_gate_collapses_a_near_duplicate_repost_in_a_real_digest() {
+        let mut database = Database::memory().expect("database");
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a1",
+            "Senate advances election reform bill",
+            "Lawmakers debated election reform provisions extensively.",
+            1_000,
+        );
+        // A same-source, near-identical repost of "a1": must collapse to one
+        // representative rather than inflating the cluster to three members.
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a2",
+            "Senate advances the election reform bill",
+            "Lawmakers debated election reform provisions extensively, updated.",
+            1_100,
+        );
+        seed_post_with_content(
+            &mut database,
+            "source-b",
+            "b1",
+            "Election reform bill clears Senate committee",
+            "The election reform legislation advanced after a lengthy committee session.",
+            900,
+        );
+
+        database.run_digest("digest-dedup").expect("digest");
+
+        let dashboard = database.dashboard(model(), host()).expect("dashboard");
+        assert_eq!(dashboard.trends.len(), 1);
+        assert_eq!(
+            dashboard.trends[0].evidence_ids.len(),
+            2,
+            "the near-duplicate repost must collapse to a single representative, not inflate the cluster"
+        );
+        assert_eq!(dashboard.trends[0].source_count, 2);
+        assert!(dashboard.trends[0].evidence_ids.contains(&"a1".to_owned()));
+        assert!(!dashboard.trends[0].evidence_ids.contains(&"a2".to_owned()));
+    }
+
+    #[test]
+    fn real_digest_trend_label_is_the_deterministic_fallback_when_no_model_is_available() {
+        // This app never calls a model to decide or phrase a trend label
+        // today, so the label persisted by a real digest run must be the
+        // deterministic term-frequency fallback -- exactly the extractive
+        // fallback pattern already used for item summaries.
+        let mut database = Database::memory().expect("database");
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a1",
+            "Senate advances election reform bill",
+            "Lawmakers debated election reform provisions extensively.",
+            1_000,
+        );
+        seed_post_with_content(
+            &mut database,
+            "source-b",
+            "b1",
+            "City council approves election reform measure",
+            "Officials finalized election reform details after lengthy negotiation.",
+            900,
+        );
+
+        database
+            .run_digest("digest-label-fallback")
+            .expect("digest");
+
+        let dashboard = database.dashboard(model(), host()).expect("dashboard");
+        assert_eq!(dashboard.trends.len(), 1);
+        assert_eq!(dashboard.trends[0].label, "Election Reform");
+        assert_eq!(dashboard.trends[0].method, TrendMethod::Lexical);
+    }
+
+    #[test]
+    fn muting_a_member_source_suppresses_a_real_generated_trend_cluster_too() {
+        // The privacy/suppression contract already covered by
+        // `privacy_feedback_suppresses_the_whole_derived_trend_until_undo_or_reset`
+        // for a manually-seeded fixture cluster must hold identically for a
+        // cluster produced by real lexical clustering.
+        let mut database = Database::memory().expect("database");
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a1",
+            "Senate advances election reform bill",
+            "Lawmakers debated election reform provisions extensively.",
+            1_000,
+        );
+        seed_post_with_content(
+            &mut database,
+            "source-b",
+            "b1",
+            "Election reform bill clears Senate committee",
+            "The election reform legislation advanced after a lengthy committee session.",
+            900,
+        );
+        database.run_digest("digest-mute-trend").expect("digest");
+        assert_eq!(
+            database
+                .dashboard(model(), host())
+                .expect("dashboard")
+                .trends
+                .len(),
+            1
+        );
+
+        database
+            .record_feedback("mute-real-trend", "a1", &FeedbackSignal::MuteSource)
+            .expect("mute");
+
+        assert!(
+            database
+                .dashboard(model(), host())
+                .expect("muted dashboard")
+                .trends
+                .is_empty(),
+            "muting a member's source must suppress the whole real trend cluster"
+        );
+    }
+
+    #[test]
+    fn lexical_clustering_membership_is_deterministic_across_two_separate_digest_runs() {
+        // Same underlying posts, two independent digest runs (each its own
+        // digest_id/cluster_id): the clustering decision itself -- which
+        // posts collapse and group together, the label, the confidence --
+        // must be identical both times.
+        let mut database = Database::memory().expect("database");
+        seed_post_with_content(
+            &mut database,
+            "source-a",
+            "a1",
+            "Senate advances election reform bill",
+            "Lawmakers debated election reform provisions extensively.",
+            1_000,
+        );
+        seed_post_with_content(
+            &mut database,
+            "source-b",
+            "b1",
+            "Election reform bill clears Senate committee",
+            "The election reform legislation advanced after a lengthy committee session.",
+            900,
+        );
+
+        database.run_digest("digest-stability-1").expect("digest 1");
+        database.run_digest("digest-stability-2").expect("digest 2");
+
+        let rows = all_trend_cluster_rows(&database);
+        assert_eq!(
+            rows.len(),
+            2,
+            "each digest run persists its own cluster row"
+        );
+        let (_, label_a, confidence_a, method_a, members_a) = &rows[0];
+        let (_, label_b, confidence_b, method_b, members_b) = &rows[1];
+        assert_eq!(label_a, label_b);
+        assert_eq!(confidence_a, confidence_b);
+        assert_eq!(method_a, method_b);
+        assert_eq!(members_a, members_b);
     }
 
     fn seed_trend(database: &Database, cluster_id: &str, member_ids: &[&str]) {

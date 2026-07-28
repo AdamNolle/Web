@@ -122,6 +122,32 @@ describe('calm dashboard', () => {
     expect(screen.getByRole('button', { name: 'Add read-only feed' })).toBeInTheDocument();
   });
 
+  it('explains the bounded learned-ranking mechanics instead of claiming ranking is inactive', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await userEvent.click(screen.getByRole('button', { name: 'Privacy & settings' }));
+    expect(screen.getByText(/at least 3 active signals/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/quarter of every edition.s slots are always chronological/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/ranking is not active/i)).not.toBeInTheDocument();
+  });
+
+  it('pauses learned ranking through a working control that persists across views', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await userEvent.click(screen.getByRole('button', { name: 'Privacy & settings' }));
+    const pause = screen.getByRole('checkbox', { name: /Pause learned ranking/ });
+    expect(pause).not.toBeChecked();
+    await userEvent.click(pause);
+    await userEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await screen.findByText('Saving private settings complete');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Sources' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Privacy & settings' }));
+    expect(screen.getByRole('checkbox', { name: /Pause learned ranking/ })).toBeChecked();
+  });
+
   it('announces settings validation without coercing a cleared field', async () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Good morning.' });
