@@ -26,10 +26,11 @@ describe('declared non-text contrast tokens', () => {
       ['#a8efbd', '#252824'],
       ['#747970', '#fbfaf6'],
       ['#8d958c', '#222522'],
-      // brand mark: white disc on the blue square, and the square on each sidebar
-      ['#ffffff', '#1d68f0'],
-      ['#1d68f0', '#eeece4'],
-      ['#1d68f0', '#1c1f1c'],
+      // brand mark: white disc on the purple square, and the square on each sidebar
+      ['#ffffff', '#5b21b6'],
+      ['#5b21b6', '#eeece4'],
+      ['#ffffff', '#8b5cf6'],
+      ['#8b5cf6', '#1c1f1c'],
     ] as const;
     for (const [foreground, surface] of pairs) {
       expect(contrast(foreground, surface)).toBeGreaterThanOrEqual(3);
@@ -40,10 +41,12 @@ describe('declared non-text contrast tokens', () => {
     expect(css).toContain('--input-border: #8d958c');
     expect(css).toContain('--control-border: #747970');
     expect(css).toContain('--control-border: #8d958c');
-    expect(css).toContain('--brand-blue: #1d68f0');
+    expect(css).toContain('--brand-fill: #5b21b6');
+    expect(css).toContain('--brand-border: #000000');
     expect(css).toContain('--brand-disc: #ffffff');
+    expect(css).toContain('--brand-fill: #8b5cf6');
     expect(css).toMatch(
-      /\.brand-mark \{[\s\S]*background: var\(--brand-blue\)[\s\S]*\.brand-mark::after \{[\s\S]*background: var\(--brand-disc\)/,
+      /\.brand-mark \{[\s\S]*background: var\(--brand-fill\)[\s\S]*\.brand-mark::after \{[\s\S]*background: var\(--brand-disc\)/,
     );
     expect(contrast('#404740', '#fbfaf6')).toBeGreaterThanOrEqual(4.5);
     expect(contrast('#e0e3de', '#222522')).toBeGreaterThanOrEqual(4.5);

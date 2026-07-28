@@ -1,4 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Web">
-  <rect width="512" height="512" rx="80" fill="#1d68f0"/>
-  <circle cx="256" cy="256" r="128" fill="#ffffff"/>
+  <rect width="512" height="512" fill="#000000"/>
+  <rect x="19" y="19" width="474" height="474" fill="#5b21b6"/>
+  <circle cx="256" cy="256" r="142" fill="#ffffff"/>
 </svg>

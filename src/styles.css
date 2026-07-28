@@ -9,7 +9,8 @@
   --control-border: #747970;
   --paper: #fbfaf6;
   --green: #486b58;
-  --brand-blue: #1d68f0;
+  --brand-fill: #5b21b6;
+  --brand-border: #000000;
   --brand-disc: #ffffff;
   --green-soft: #e2ebe4;
   --topic-text: #294c39;
@@ -92,13 +93,13 @@ a:focus-visible {
   place-items: center;
   width: 2.3rem;
   height: 2.3rem;
-  border-radius: 15.6%;
-  background: var(--brand-blue);
+  border: 0.08rem solid var(--brand-border);
+  background: var(--brand-fill);
 }
 .brand-mark::after {
   content: '';
-  width: 50%;
-  height: 50%;
+  width: 55.6%;
+  height: 55.6%;
   border-radius: 50%;
   background: var(--brand-disc);
 }
@@ -949,6 +950,7 @@ input[aria-invalid='true'] {
     --line: #515650;
     --control-border: #8d958c;
     --paper: #222522;
+    --brand-fill: #8b5cf6;
     --green: #9bc8aa;
     --green-soft: #294034;
     --topic-text: #c8ead2;
