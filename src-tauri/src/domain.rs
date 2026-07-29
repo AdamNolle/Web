@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::connectors::ConnectorDescriptor;
+use crate::connectors::{ConnectorDescriptor, export_import::ImportPlatform};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -349,6 +349,39 @@ pub struct AddRssSourceRequest {
     pub request_id: String,
     pub label: String,
     pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenOriginalRequest {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImportArchiveRequest {
+    pub request_id: String,
+    pub platform: ImportPlatform,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportArchiveStatus {
+    Canceled,
+    Imported,
+    Replayed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportArchiveResult {
+    pub status: ImportArchiveStatus,
+    pub source_id: Option<String>,
+    pub imported_items: usize,
+    pub skipped_items: usize,
+    pub changed_items: usize,
+    pub dashboard: Dashboard,
 }
 
 #[derive(Debug, Clone, Deserialize)]

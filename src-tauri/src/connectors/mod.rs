@@ -1,3 +1,4 @@
+pub mod export_import;
 mod rss;
 
 use std::fmt;
@@ -196,7 +197,7 @@ impl TimestampKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedPost {
     pub remote_id: String,
     pub canonical_url: Option<String>,

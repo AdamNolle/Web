@@ -9,7 +9,10 @@ pub mod redaction;
 pub mod scheduler;
 pub mod secrets;
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::future::Future;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
@@ -19,25 +22,34 @@ use std::time::Duration;
 use chrono::{Local, Utc};
 use connectors::{
     Connector, ConnectorError, ConnectorSyncRequest, ConnectorTransport, RssConnector, SourceKind,
-    SourceSyncSpec, SyncPage, SyncRequest, validate_sync_request,
+    SourceSyncSpec, SyncPage, SyncRequest,
+    export_import::{
+        ImportError, ImportPlatform, MAX_IMPORT_FILE_BYTES, MAX_IMPORT_ITEMS, parse_export_file,
+    },
+    validate_sync_request,
 };
 use db::{
     Database, InferenceCandidate, PreparedPost, RequestDisposition, RssSourceSpec,
-    SourceSelectionMode, content_hash, validate_id,
+    SourceSelectionMode, content_hash, validate_id, validate_source_label,
 };
 use domain::{
     AddRssSourceRequest, AppError, AppResult, Dashboard, DeleteSourceRequest, FeedbackRequest,
-    ModelState, ResetLearningRequest, RunDigestRequest, SyncSourcesRequest, SyncSourcesResult,
-    UndoFeedbackRequest, UpdateSettingsRequest,
+    ImportArchiveRequest, ImportArchiveResult, ImportArchiveStatus, ModelState,
+    OpenOriginalRequest, ResetLearningRequest, RunDigestRequest, SyncSourcesRequest,
+    SyncSourcesResult, UndoFeedbackRequest, UpdateSettingsRequest,
 };
 use inference::{
     DeterministicFallback, InferenceProvider, OllamaProvider, PROMPT_VERSION, SummaryRequest,
     fallback_status,
 };
 use secrets::{OsSecretStore, SecretStore};
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
+use url::Url;
 
 const OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
+const MAX_ORIGINAL_URL_BYTES: usize = 2 * 1024;
 // Whole-run model-summarization budget. Bounded by the existing envelope this
 // runner already promises: MAX_SOURCES_PER_RUN (20) sources at the RSS
 // transport's worst-case REQUEST_TIMEOUT (15s, connectors/rss.rs) can consume
@@ -54,6 +66,11 @@ const MAX_MODEL_ITEMS_PER_BATCH: usize = 6;
 // failure (not just a test) if the cap is ever widened past a small hard
 // bound or made unlimited.
 const _: () = assert!(MAX_MODEL_ITEMS_PER_BATCH > 0 && MAX_MODEL_ITEMS_PER_BATCH <= 10);
+const MAX_ARCHIVE_MODEL_ITEMS_PER_IMPORT: usize = 1;
+const _: () = assert!(
+    MAX_ARCHIVE_MODEL_ITEMS_PER_IMPORT > 0
+        && MAX_ARCHIVE_MODEL_ITEMS_PER_IMPORT <= MAX_MODEL_ITEMS_PER_BATCH
+);
 const MAX_SOURCES_PER_RUN: usize = 20;
 const RUNNER_LEASE_MS: i64 = 10 * 60 * 1_000;
 const RUNNER_DEADLINE: Duration = Duration::from_secs(8 * 60);
@@ -574,6 +591,226 @@ fn summary_request_for_candidate(candidate: &InferenceCandidate) -> SummaryReque
     }
 }
 
+fn map_import_error(error: ImportError) -> AppError {
+    match error {
+        ImportError::FileTooLarge => {
+            AppError::validation("That archive file is larger than the 20 MiB import limit.")
+        }
+        ImportError::TooManyItems => AppError::validation(format!(
+            "That archive contains more than {MAX_IMPORT_ITEMS} entries. Import a smaller archive part."
+        )),
+        ImportError::ConflictingDuplicate { .. } => {
+            AppError::validation("That archive contains conflicting entries for the same post.")
+        }
+        ImportError::UnreadableFile => AppError::validation("That archive file could not be read."),
+        ImportError::UnrecognizedFormat => {
+            AppError::validation("That file is not a recognized archive export.")
+        }
+        ImportError::NoItemsFound => {
+            AppError::validation("No importable posts were found in that archive file.")
+        }
+    }
+}
+
+fn read_import_file_bounded(path: &Path) -> Result<Vec<u8>, ImportError> {
+    let metadata = std::fs::metadata(path).map_err(|_| ImportError::UnreadableFile)?;
+    if !metadata.is_file() {
+        return Err(ImportError::UnreadableFile);
+    }
+    if metadata.len() > MAX_IMPORT_FILE_BYTES {
+        return Err(ImportError::FileTooLarge);
+    }
+    let capacity = usize::try_from(metadata.len()).map_err(|_| ImportError::FileTooLarge)?;
+    let file = File::open(path).map_err(|_| ImportError::UnreadableFile)?;
+    let mut reader = file.take(MAX_IMPORT_FILE_BYTES.saturating_add(1));
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|_| ImportError::UnreadableFile)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_IMPORT_FILE_BYTES {
+        return Err(ImportError::FileTooLarge);
+    }
+    Ok(bytes)
+}
+
+async fn pick_archive_file(
+    app: &AppHandle,
+    platform: ImportPlatform,
+) -> AppResult<Option<PathBuf>> {
+    let picker = app
+        .dialog()
+        .file()
+        .set_title("Choose an official social archive export");
+    let picker = match platform {
+        ImportPlatform::X => picker.add_filter("X data export", &["js", "json"]),
+        ImportPlatform::Instagram => picker.add_filter("Instagram data export", &["json"]),
+    };
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    picker.pick_file(move |selection| {
+        let _ = sender.send(selection);
+    });
+    match receiver.await.map_err(|_| AppError::internal())? {
+        Some(file) => file
+            .into_path()
+            .map(Some)
+            .map_err(|_| AppError::validation("The selected archive is not a local file.")),
+        None => Ok(None),
+    }
+}
+
+async fn import_archive_with_loader<F, Fut>(
+    state: &AppState,
+    request: &ImportArchiveRequest,
+    loader: F,
+) -> AppResult<ImportArchiveResult>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = AppResult<Option<Vec<u8>>>>,
+{
+    validate_id(&request.request_id)?;
+    validate_source_label(&request.label)?;
+    let _sync_guard = state
+        .sync_gate
+        .try_lock()
+        .map_err(|_| AppError::conflict("A source sync or deletion is already running."))?;
+    let payload_hash = content_hash(&format!(
+        "{}\n{}",
+        request.platform.as_str(),
+        request.label.trim()
+    ));
+    let admission = admit_external_command(state.database()?.begin_request(
+        &request.request_id,
+        "import_archive",
+        &payload_hash,
+    )?)?;
+    if admission == ExternalCommandAdmission::ReplayComplete {
+        let source_id = state
+            .database()?
+            .source_id_for_request(&request.request_id)?
+            .ok_or_else(AppError::internal)?;
+        return Ok(ImportArchiveResult {
+            status: ImportArchiveStatus::Replayed,
+            source_id: Some(source_id),
+            imported_items: 0,
+            skipped_items: 0,
+            changed_items: 0,
+            dashboard: state.dashboard().await?,
+        });
+    }
+
+    let bytes = match loader().await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            state.database()?.abort_request(&request.request_id);
+            return Ok(ImportArchiveResult {
+                status: ImportArchiveStatus::Canceled,
+                source_id: None,
+                imported_items: 0,
+                skipped_items: 0,
+                changed_items: 0,
+                dashboard: state.dashboard().await?,
+            });
+        }
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(error);
+        }
+    };
+    let parsed = match parse_export_file(request.platform, &bytes, request.label.trim()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_import_error(error));
+        }
+    };
+    let selected_model = state.database()?.settings()?.selected_model;
+    let changed_posts = match state.database()?.changed_export_import_posts(
+        &request.label,
+        request.platform.as_str(),
+        &parsed.posts,
+    ) {
+        Ok(posts) => posts,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(error);
+        }
+    };
+    let candidates = changed_posts
+        .into_iter()
+        .map(InferenceCandidate::unavailable)
+        .collect::<Vec<_>>();
+    let (prepared, _) = match state
+        .prepare_posts(
+            &candidates,
+            &selected_model,
+            MAX_ARCHIVE_MODEL_ITEMS_PER_IMPORT,
+        )
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(error);
+        }
+    };
+    let imported_items = parsed.posts.len();
+    let skipped_items = parsed.skipped;
+    let stored = state.database()?.add_export_import_source(
+        &request.request_id,
+        &request.label,
+        request.platform.as_str(),
+        &parsed.posts,
+        skipped_items,
+        prepared,
+    );
+    let (source_id, changed_items) = match stored {
+        Ok(result) => result,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(error);
+        }
+    };
+    Ok(ImportArchiveResult {
+        status: ImportArchiveStatus::Imported,
+        source_id: Some(source_id),
+        imported_items,
+        skipped_items,
+        changed_items,
+        dashboard: state.dashboard().await?,
+    })
+}
+
+fn validate_original_url(value: &str) -> AppResult<Url> {
+    const MESSAGE: &str =
+        "Only credential-free HTTPS source URLs up to 2 KiB can be opened externally.";
+
+    if value.is_empty() || value.len() > MAX_ORIGINAL_URL_BYTES {
+        return Err(AppError::validation(MESSAGE));
+    }
+    let url = Url::parse(value).map_err(|_| AppError::validation(MESSAGE))?;
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(AppError::validation(MESSAGE));
+    }
+    Ok(url)
+}
+
+fn open_original_with<F, E>(request: &OpenOriginalRequest, open: F) -> AppResult<()>
+where
+    F: FnOnce(&str) -> Result<(), E>,
+{
+    let url = validate_original_url(&request.url)?;
+    open(url.as_str()).map_err(|_| AppError::internal())
+}
+
+#[tauri::command]
+fn open_original(app: AppHandle, request: OpenOriginalRequest) -> AppResult<()> {
+    open_original_with(&request, |url| app.opener().open_url(url, None::<&str>))
+}
+
 #[tauri::command]
 async fn get_dashboard(state: State<'_, AppState>) -> AppResult<Dashboard> {
     state.dashboard().await
@@ -772,6 +1009,26 @@ fn map_connector_error(error: ConnectorError) -> AppError {
 }
 
 #[tauri::command]
+async fn import_archive(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ImportArchiveRequest,
+) -> AppResult<ImportArchiveResult> {
+    let platform = request.platform;
+    import_archive_with_loader(&state, &request, move || async move {
+        let Some(path) = pick_archive_file(&app, platform).await? else {
+            return Ok(None);
+        };
+        let bytes = tokio::task::spawn_blocking(move || read_import_file_bounded(&path))
+            .await
+            .map_err(|_| AppError::internal())?
+            .map_err(map_import_error)?;
+        Ok(Some(bytes))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn delete_source(
     state: State<'_, AppState>,
     request: DeleteSourceRequest,
@@ -850,6 +1107,12 @@ impl AppError {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data)?;
@@ -869,6 +1132,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            open_original,
             get_dashboard,
             run_digest,
             sync_sources,
@@ -876,6 +1140,7 @@ pub fn run() {
             undo_feedback,
             update_settings,
             add_rss_source,
+            import_archive,
             delete_source,
             reset_learning
         ])
@@ -887,6 +1152,236 @@ pub fn run() {
 mod runtime_tests {
     use super::*;
     use crate::connectors::SyncPage;
+    use std::sync::Arc;
+
+    #[test]
+    fn original_url_validation_accepts_only_bounded_credential_free_https() {
+        let valid = validate_original_url("https://example.com/source?id=7#discussion")
+            .expect("credential-free HTTPS URL");
+        assert_eq!(valid.as_str(), "https://example.com/source?id=7#discussion");
+
+        for invalid in [
+            "",
+            "not a URL",
+            "http://example.com/source",
+            "https://",
+            "https://reader@example.com/source",
+            "https://reader:secret@example.com/source",
+        ] {
+            let error = validate_original_url(invalid).expect_err("unsafe URL must be rejected");
+            assert_eq!(error.code, "VALIDATION");
+        }
+
+        let oversized = format!("https://example.com/{}", "a".repeat(MAX_ORIGINAL_URL_BYTES));
+        let error = validate_original_url(&oversized).expect_err("oversized URL must be rejected");
+        assert_eq!(error.code, "VALIDATION");
+    }
+
+    #[test]
+    fn original_url_dispatch_uses_validated_url_and_maps_launcher_failures() {
+        let request = OpenOriginalRequest {
+            url: "https://example.com/original".into(),
+        };
+        let mut opened = None;
+        open_original_with(&request, |url| {
+            opened = Some(url.to_owned());
+            Ok::<(), ()>(())
+        })
+        .expect("open dispatch");
+        assert_eq!(opened.as_deref(), Some("https://example.com/original"));
+
+        let error = open_original_with(&request, |_url| Err::<(), _>("launcher unavailable"))
+            .expect_err("launcher failure");
+        assert_eq!(error.code, "INTERNAL");
+    }
+
+    #[test]
+    fn renderer_capability_does_not_expose_opener_commands() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/main.json")).expect("capability");
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("permissions array");
+        assert!(permissions.iter().all(|permission| {
+            !permission
+                .as_str()
+                .is_some_and(|name| name.starts_with("opener:"))
+        }));
+    }
+
+    #[test]
+    fn bounded_archive_reader_rejects_non_files_and_oversized_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        assert!(matches!(
+            read_import_file_bounded(directory.path()),
+            Err(ImportError::UnreadableFile)
+        ));
+        let oversized = directory.path().join("oversized.json");
+        let file = File::create(&oversized).expect("file");
+        file.set_len(MAX_IMPORT_FILE_BYTES + 1)
+            .expect("sparse oversized file");
+        assert!(matches!(
+            read_import_file_bounded(&oversized),
+            Err(ImportError::FileTooLarge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn archive_import_core_handles_cancel_replay_reimport_and_sync_gate() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(directory.path().join("archive-command.sqlite3")).expect("state");
+        let canceled_request = ImportArchiveRequest {
+            request_id: "archive-cancel".into(),
+            platform: ImportPlatform::X,
+            label: "Ada archive".into(),
+        };
+        let canceled = import_archive_with_loader(&state, &canceled_request, || async {
+            Ok::<Option<Vec<u8>>, AppError>(None)
+        })
+        .await
+        .expect("cancel is not an error");
+        assert_eq!(canceled.status, ImportArchiveStatus::Canceled);
+        assert!(canceled.source_id.is_none());
+        let canceled_receipts: i64 = state
+            .database()
+            .expect("database")
+            .connection_for_test()
+            .query_row(
+                "SELECT COUNT(*) FROM request_receipts WHERE request_id='archive-cancel'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("receipt count");
+        assert_eq!(canceled_receipts, 0);
+
+        let request = ImportArchiveRequest {
+            request_id: "archive-import".into(),
+            platform: ImportPlatform::X,
+            label: "Ada archive".into(),
+        };
+        let bytes = include_bytes!("../../tests/fixtures/x_tweets_sample.fixture").to_vec();
+        let imported = import_archive_with_loader(&state, &request, move || async move {
+            Ok::<Option<Vec<u8>>, AppError>(Some(bytes))
+        })
+        .await
+        .expect("import");
+        assert_eq!(imported.status, ImportArchiveStatus::Imported);
+        assert_eq!(imported.imported_items, 2);
+        let source_id = imported.source_id.clone().expect("source id");
+
+        let loader_called = Arc::new(AtomicBool::new(false));
+        let replay_called = Arc::clone(&loader_called);
+        let replayed = import_archive_with_loader(&state, &request, move || {
+            replay_called.store(true, Ordering::SeqCst);
+            async { Ok::<Option<Vec<u8>>, AppError>(None) }
+        })
+        .await
+        .expect("replay");
+        assert_eq!(replayed.status, ImportArchiveStatus::Replayed);
+        assert_eq!(replayed.source_id.as_deref(), Some(source_id.as_str()));
+        assert!(!loader_called.load(Ordering::SeqCst));
+
+        let reimport_request = ImportArchiveRequest {
+            request_id: "archive-reimport".into(),
+            platform: ImportPlatform::X,
+            label: "Ada archive".into(),
+        };
+        let bytes = include_bytes!("../../tests/fixtures/x_tweets_sample.fixture").to_vec();
+        let reimported =
+            import_archive_with_loader(&state, &reimport_request, move || async move {
+                Ok::<Option<Vec<u8>>, AppError>(Some(bytes))
+            })
+            .await
+            .expect("reimport");
+        assert_eq!(reimported.source_id.as_deref(), Some(source_id.as_str()));
+        assert_eq!(reimported.changed_items, 0);
+
+        let gate = state.sync_gate.lock().await;
+        let blocked_called = Arc::new(AtomicBool::new(false));
+        let blocked_probe = Arc::clone(&blocked_called);
+        let blocked_request = ImportArchiveRequest {
+            request_id: "archive-blocked".into(),
+            platform: ImportPlatform::Instagram,
+            label: "Blocked archive".into(),
+        };
+        let blocked = import_archive_with_loader(&state, &blocked_request, move || {
+            blocked_probe.store(true, Ordering::SeqCst);
+            async { Ok::<Option<Vec<u8>>, AppError>(None) }
+        })
+        .await
+        .expect_err("sync gate blocks import");
+        assert_eq!(blocked.code, "CONFLICT");
+        assert!(!blocked_called.load(Ordering::SeqCst));
+        drop(gate);
+    }
+
+    #[tokio::test]
+    async fn instagram_reimport_reuses_media_identity_and_updates_the_existing_post() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state =
+            AppState::new(directory.path().join("instagram-reimport.sqlite3")).expect("state");
+        let first_request = ImportArchiveRequest {
+            request_id: "instagram-import-first".into(),
+            platform: ImportPlatform::Instagram,
+            label: "Ada Instagram archive".into(),
+        };
+        let first_bytes = br#"[
+            {
+                "title":"Original caption",
+                "creation_timestamp":1784000000,
+                "media":[
+                    {"uri":"media/posts/2026/a.jpg"},
+                    {"uri":"media/posts/2026/b.jpg"}
+                ]
+            }
+        ]"#
+        .to_vec();
+        let first = import_archive_with_loader(&state, &first_request, move || async move {
+            Ok::<Option<Vec<u8>>, AppError>(Some(first_bytes))
+        })
+        .await
+        .expect("first Instagram import");
+        assert_eq!(first.changed_items, 1);
+        assert_eq!(first.imported_items, 1);
+        let source_id = first.source_id.expect("source id");
+
+        let edited_request = ImportArchiveRequest {
+            request_id: "instagram-import-edited".into(),
+            platform: ImportPlatform::Instagram,
+            label: "Ada Instagram archive".into(),
+        };
+        let edited_bytes = br#"[
+            {
+                "title":"Edited caption",
+                "creation_timestamp":1784000000,
+                "media":[
+                    {"uri":"media\\posts\\2026\\b.jpg"},
+                    {"uri":"media/posts/2026/./a.jpg"},
+                    {"uri":"media/posts/2026/a.jpg"}
+                ]
+            }
+        ]"#
+        .to_vec();
+        let edited = import_archive_with_loader(&state, &edited_request, move || async move {
+            Ok::<Option<Vec<u8>>, AppError>(Some(edited_bytes))
+        })
+        .await
+        .expect("edited Instagram re-import");
+        assert_eq!(edited.source_id.as_deref(), Some(source_id.as_str()));
+        assert_eq!(edited.changed_items, 1);
+
+        let stored: (i64, String) = state
+            .database()
+            .expect("database")
+            .connection_for_test()
+            .query_row(
+                "SELECT COUNT(*), MAX(body_text) FROM posts WHERE source_id=?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("stored Instagram post");
+        assert_eq!(stored, (1, "Edited caption".to_owned()));
+    }
 
     fn stale_disposition(
         database: &Database,

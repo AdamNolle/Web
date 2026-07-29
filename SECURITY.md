@@ -32,8 +32,9 @@ long-term-support branches yet.
 
 ## Scope
 
-In scope: the Rust core (`src-tauri/`), the RSS/Atom connector, the
-local-model (Ollama) integration, SQLite persistence/migrations, the
+In scope: the Rust core (`src-tauri/`), the RSS/Atom connector, official
+archive import parsers/native picker, the bounded HTTPS original-link command,
+the local-model (Ollama) integration, SQLite persistence/migrations, the
 OS-vault credential boundary, and the React renderer's IPC surface.
 
 Out of scope: vulnerabilities that require the attacker to already have

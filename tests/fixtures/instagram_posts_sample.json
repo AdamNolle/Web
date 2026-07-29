@@ -1,0 +1,22 @@
+[
+  {
+    "title": "Multi-photo caption here, from the post level.",
+    "creation_timestamp": 1690000000,
+    "media": [
+      { "uri": "media/photo1.jpg", "creation_timestamp": 1690000000 },
+      { "uri": "media/photo2.jpg", "creation_timestamp": 1690000001 }
+    ]
+  },
+  {
+    "media": [
+      {
+        "uri": "media/photo3.jpg",
+        "creation_timestamp": 1690000100,
+        "title": "Single photo caption here, from the media item."
+      }
+    ]
+  },
+  {
+    "media": [{ "uri": "media/photo4.jpg" }]
+  }
+]

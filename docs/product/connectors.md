@@ -3,6 +3,7 @@
 | Source             | Foundation status              | Honest capability                                                                           |
 | ------------------ | ------------------------------ | ------------------------------------------------------------------------------------------- |
 | RSS/Atom           | Implemented                    | User-selected publisher feeds; comments are generally unavailable                           |
+| X/Instagram export | Implemented manual import      | User-selected official archive file; local history only, never a live connector             |
 | Bluesky            | Blocked descriptor only        | Requires public HTTPS client metadata/policy, owned callback, exact scopes, and OAuth tests |
 | Mastodon           | Validation-required descriptor | Requires per-instance OAuth compatibility and provider-policy validation before enablement  |
 | YouTube            | Deferred                       | Subscription uploads and public comments, not personalized Home                             |
@@ -14,9 +15,30 @@
 
 Every connector must document its dated official endpoints, native OAuth + PKCE flow, exact read scopes, quota/cost, attribution, retention/deletion, derived-summary/embedding rules, and app-review status. Missing API access is a product limitation—not authorization for private endpoints, scraping, cookies, stealth, fingerprint manipulation, CAPTCHA bypass, or proxy/identity rotation.
 
+## Official archive import
+
+Archive import is deliberately not a `Connector`: it has no network client, cursor, retry, OAuth,
+or scheduled synchronization. A Rust-owned native dialog accepts one extracted X
+`data/tweets.js`/`tweet.js` or Instagram `posts_1.json` file at a time. The renderer never sends or
+receives a filesystem path.
+
+The disk reader and parser each enforce a 20 MiB ceiling, and one import accepts at most 25,000
+entries. This archive-specific envelope is separate from the 100-post live-connector page bound;
+the parser streams entries and aborts before allocating entry 25,001. Files above either archive
+limit fail explicitly instead of silently dropping their tail.
+Malformed entries and exact duplicates are skipped with partial health/finality instead of being
+called a complete import; conflicting duplicate identities reject the file before inference or
+persistence. The same trimmed label and platform identify a manual re-import, which updates or adds
+changed posts without resummarizing unchanged content. A different platform cannot reuse that label.
+Import command receipts are replay-safe and commit atomically with the imported source.
+
+Current limitations: ZIP archives are not unpacked, multipart exports require repeated same-label
+imports, renaming creates a second source, post-selection progress/cancellation is not implemented,
+and real native-dialog behavior still needs packaged end-to-end evidence.
+
 ## Provider-neutral read contract
 
-Rust exposes backend-owned connector descriptors; only RSS is `available`. Mastodon is `validation_required` and Bluesky is `blocked`. These are informational states, not Connect controls. The renderer receives no token, connector network access, or browser-launch permission.
+Rust exposes backend-owned connector descriptors; only RSS is `available`. Mastodon is `validation_required` and Bluesky is `blocked`. These are informational states, not Connect controls. The renderer receives no token, connector network access, or provider OAuth/browser-launch permission.
 
 Every connector batch is read-only and capped at 100 posts, 50 comments per post, 500 comments and 256 KiB of comment text per sync, 4,000 bytes per comment, and depth 8. It carries an opaque bounded cursor, typed health/retry state, page finality, an explicit post scope, and comment completeness/truncation. Persistence validates every stored string, normalized HTTP(S) canonical URL, source config/cursor, and full batch before a transaction, then rechecks source generation, input cursor, and any resident owner/token/expiry while committing posts, comments, cursor, and metadata. Remote comment IDs are source-wide immutable identities: duplicates and attempts to move an existing ID to another post fail before effects. Complete untruncated comment snapshots replace comments only inside their declared post scope; partial/truncated evidence requires partial page/source/job truth and only upserts observed evidence. RSS always reports comments `unavailable`, keeps its original character-based parser bounds (including multibyte text), and retains separate representation-bound HTTP validator state.
 

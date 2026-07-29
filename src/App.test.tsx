@@ -6,7 +6,29 @@ import { demoDashboard } from './demoData';
 import { createDemoTransport, setTransportForTests, type AppTransport } from './transport';
 import type { Dashboard } from './types';
 
-beforeEach(() => setTransportForTests(createDemoTransport()));
+beforeEach(() => {
+  setTransportForTests(createDemoTransport());
+  const storedPresentationState = new Map<string, string>();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => storedPresentationState.get(key) ?? null,
+      setItem: (key: string, value: string) => storedPresentationState.set(key, value),
+      removeItem: (key: string) => storedPresentationState.delete(key),
+      clear: () => storedPresentationState.clear(),
+      key: (index: number) => [...storedPresentationState.keys()][index] ?? null,
+      get length() {
+        return storedPresentationState.size;
+      },
+    } satisfies Storage,
+  });
+  document.documentElement.dataset.theme = 'auto';
+  document.documentElement.dataset.themeMode = 'auto';
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: undefined,
+  });
+});
 
 describe('calm dashboard', () => {
   it('renders a finite edition with provenance and a natural end', async () => {
@@ -21,6 +43,168 @@ describe('calm dashboard', () => {
     );
     expect(screen.getByText(/The largest gains came from better task framing/)).toBeInTheDocument();
     expect(screen.getByText('https://example.com/local-models')).toBeInTheDocument();
+  });
+
+  it('opens eligible HTTPS evidence through the app transport and reports success', async () => {
+    const testTransport = createDemoTransport();
+    const openOriginal = vi.fn(async () => undefined);
+    testTransport.openOriginal = openOriginal;
+    setTransportForTests(testTransport);
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(
+      screen.getByRole('button', { name: /Show evidence for Smaller local models/ }),
+    );
+    await user.click(
+      screen.getByRole('button', {
+        name: /Open original for Smaller local models.* from Practical AI Notes/,
+      }),
+    );
+
+    expect(openOriginal).toHaveBeenCalledOnce();
+    expect(openOriginal).toHaveBeenCalledWith('https://example.com/local-models');
+    await waitFor(() =>
+      expect(
+        screen.getByText('Status: Original source opened in your default browser.'),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it('surfaces original-opening failures through the existing notice', async () => {
+    const testTransport = createDemoTransport();
+    testTransport.openOriginal = vi.fn(async () => {
+      throw new Error('The browser launcher is unavailable.');
+    });
+    setTransportForTests(testTransport);
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(
+      screen.getByRole('button', { name: /Show evidence for Smaller local models/ }),
+    );
+    await user.click(
+      screen.getByRole('button', {
+        name: /Open original for Smaller local models.* from Practical AI Notes/,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText('Status: The browser launcher is unavailable.')).toBeInTheDocument(),
+    );
+  });
+
+  it('keeps HTTP and absent evidence URLs non-operable', async () => {
+    const dashboard = structuredClone(demoDashboard);
+    const firstItem = dashboard.items[0]!;
+    const evidence = firstItem.evidence[0]!;
+    firstItem.evidence = [
+      { ...evidence, canonicalUrl: 'http://example.com/copy-only' },
+      { ...evidence, source: 'No URL fixture', canonicalUrl: null },
+    ];
+    const testTransport = createDemoTransport();
+    const openOriginal = vi.fn(async () => undefined);
+    testTransport.getDashboard = async () => dashboard;
+    testTransport.openOriginal = openOriginal;
+    setTransportForTests(testTransport);
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(
+      screen.getByRole('button', { name: /Show evidence for Smaller local models/ }),
+    );
+
+    expect(screen.getByText('http://example.com/copy-only')).toBeInTheDocument();
+    expect(screen.getByText('No canonical web URL was supplied.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Open original/ })).not.toBeInTheDocument();
+    expect(openOriginal).not.toHaveBeenCalled();
+  });
+
+  it('opens the command palette from the keyboard, navigates with arrows, and restores focus', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    const origin = screen.getByRole('button', { name: 'Sources' });
+    origin.focus();
+
+    await user.keyboard('{Control>}k{/Control}');
+    const dialog = screen.getByRole('dialog', { name: 'Command palette' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    const search = within(dialog).getByRole('combobox', { name: 'Search commands' });
+    await waitFor(() => expect(search).toHaveFocus());
+    const options = within(dialog).getAllByRole('option');
+    expect(options[0]).toHaveAttribute('aria-selected', 'true');
+    expect(within(dialog).getByText('Practical AI Notes')).toBeInTheDocument();
+    expect(
+      within(dialog).getByText('Local-first tools are narrowing the convenience gap'),
+    ).toBeInTheDocument();
+
+    await user.keyboard('{ArrowDown}');
+    expect(options[1]).toHaveAttribute('aria-selected', 'true');
+    expect(search).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(origin).toHaveFocus());
+
+    await user.keyboard('{Meta>}k{/Meta}');
+    const reopened = screen.getByRole('dialog', { name: 'Command palette' });
+    const reopenedSearch = within(reopened).getByRole('combobox', { name: 'Search commands' });
+    await user.type(reopenedSearch, 'Trends');
+    await user.keyboard('{Enter}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: 'Trends, without the hype.' })).toHaveFocus(),
+    );
+  });
+
+  it('persists explicit themes and follows system changes only in Auto mode', async () => {
+    let prefersDark = true;
+    const listeners = new Set<() => void>();
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({
+        get matches() {
+          return prefersDark;
+        },
+        media: '(prefers-color-scheme: dark)',
+        onchange: null,
+        addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
+        removeEventListener: (_type: string, listener: () => void) => listeners.delete(listener),
+        dispatchEvent: () => true,
+      })),
+    });
+    const user = userEvent.setup();
+    const rendered = render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    const themes = screen.getByRole('radiogroup', { name: 'Theme' });
+    const auto = within(themes).getByRole('radio', { name: 'Auto' });
+    const light = within(themes).getByRole('radio', { name: 'Light' });
+    const dark = within(themes).getByRole('radio', { name: 'Dark' });
+    expect(auto).toBeChecked();
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark');
+
+    prefersDark = false;
+    act(() => listeners.forEach((listener) => listener()));
+    expect(document.documentElement).toHaveAttribute('data-theme', 'light');
+
+    await user.click(dark);
+    expect(window.localStorage.getItem('web.presentation.theme')).toBe('dark');
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark');
+    expect(dark).toBeChecked();
+
+    prefersDark = false;
+    act(() => listeners.forEach((listener) => listener()));
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark');
+
+    rendered.unmount();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    expect(screen.getByRole('radio', { name: 'Dark' })).toBeChecked();
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark');
+    expect(light).not.toBeInTheDocument();
   });
 
   it('uses explicit reversible feedback instead of passive behavior', async () => {
@@ -558,6 +742,12 @@ describe('calm dashboard', () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Good morning.' });
     await userEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    expect(screen.getByRole('heading', { name: 'System snapshot' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Runner' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Model path' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Source health' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Chronological activity' })).toBeInTheDocument();
+    expect(screen.getByRole('table', { name: /Current health/ })).toBeInTheDocument();
     const state = await screen.findByText('partial · more may remain');
     expect(state).toHaveClass('activity-state', 'partial');
   });
@@ -577,7 +767,73 @@ describe('calm dashboard', () => {
     expect(screen.queryByLabelText(/token|password|credential/i)).not.toBeInTheDocument();
   });
 
-  it('renders an explicit production-style empty source state', async () => {
+  it('imports an official archive through the native picker contract', async () => {
+    const user = userEvent.setup();
+    const base = createDemoTransport();
+    const importedDashboard: Dashboard = structuredClone(demoDashboard);
+    const template = importedDashboard.sources[0];
+    if (!template) throw new Error('demo source fixture is required');
+    importedDashboard.sources.push({
+      ...template,
+      id: 'import-instagram',
+      kind: 'archive_import',
+      label: 'Family Instagram archive',
+      detail: 'One-time local archive import.',
+      nextSync: null,
+      itemCount: 1,
+    });
+    let received: { requestId: string; platform: 'x' | 'instagram'; label: string } | undefined;
+    const importArchive: AppTransport['importArchive'] = async (requestId, platform, label) => {
+      received = { requestId, platform, label };
+      return {
+        status: 'imported',
+        sourceId: 'import-instagram',
+        importedItems: 1,
+        skippedItems: 0,
+        changedItems: 1,
+        dashboard: structuredClone(importedDashboard),
+      };
+    };
+    setTransportForTests(
+      new Proxy(base, {
+        get(target, property, receiver) {
+          if (property === 'importArchive') return importArchive;
+          return Reflect.get(target, property, receiver);
+        },
+      }) as AppTransport,
+    );
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Sources' }));
+    expect(
+      screen.getByRole('heading', { name: 'Import an official data archive' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/25,000 entries per import/)).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText('Archive platform'), 'instagram');
+    const label = screen.getByLabelText('Archive name');
+    await user.clear(label);
+    await user.type(label, 'Family Instagram archive');
+    await user.click(screen.getByRole('button', { name: 'Choose archive file' }));
+
+    expect(
+      await screen.findAllByText(/Imported 1 Instagram posts; 1 local items changed/),
+    ).not.toHaveLength(0);
+    expect(received).toMatchObject({
+      platform: 'instagram',
+      label: 'Family Instagram archive',
+    });
+    expect(received?.requestId).toEqual(expect.any(String));
+    expect(screen.getByRole('heading', { name: 'Family Instagram archive' })).toBeInTheDocument();
+    expect(screen.getByText('Manual re-import only')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Activity' }));
+    const archiveHealthRow = screen.getByRole('row', { name: /Family Instagram archive/ });
+    expect(within(archiveHealthRow).getByText('Manual re-import only')).toBeInTheDocument();
+  });
+
+  it('routes first-run source actions to the relevant focused controls', async () => {
+    const user = userEvent.setup();
     const empty = structuredClone(demoDashboard);
     empty.sources = [];
     empty.items = [];
@@ -592,8 +848,47 @@ describe('calm dashboard', () => {
     }) as AppTransport;
     setTransportForTests(emptyTransport);
     render(<App />);
+    expect(
+      await screen.findByRole('heading', { name: 'Choose your first source.' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Ready to add your first source')).toHaveClass('live-region');
+    expect(screen.getByText('Status: Ready to add your first source')).toBeInTheDocument();
+    expect(screen.getByText(/Source data, summaries, and feedback stay/)).toBeInTheDocument();
+    expect(screen.getByText(/never posts, follows, likes/)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'You’re caught up.' })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Add an RSS feed' }));
+    expect(screen.getByRole('heading', { name: 'Your sources.' })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText('Feed name')).toHaveFocus());
+
+    await user.click(screen.getByRole('button', { name: 'Today' }));
+    await user.click(screen.getByRole('button', { name: 'Import an official archive' }));
+    expect(
+      screen.getByRole('heading', { name: 'Import an official data archive' }),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText('Archive platform')).toHaveFocus());
+  });
+
+  it('keeps the normal caught-up edition when connected sources have no eligible items', async () => {
+    const emptyEdition = structuredClone(demoDashboard);
+    emptyEdition.items = [];
+    emptyEdition.trends = [];
+    const base = createDemoTransport();
+    setTransportForTests(
+      new Proxy(base, {
+        get(target, property, receiver) {
+          if (property === 'getDashboard') return async () => emptyEdition;
+          return Reflect.get(target, property, receiver);
+        },
+      }) as AppTransport,
+    );
+
+    render(<App />);
     await screen.findByRole('heading', { name: 'Good morning.' });
-    await userEvent.click(screen.getByRole('button', { name: 'Sources' }));
-    expect(screen.getByText(/No sources are connected yet/)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'You’re caught up.' })).toBeInTheDocument();
+    expect(screen.getByText('0 useful items')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Import an official archive' }),
+    ).not.toBeInTheDocument();
   });
 });

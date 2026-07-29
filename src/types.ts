@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 export const SourceSchema = z.object({
   id: z.string(),
-  kind: z.enum(['demo', 'rss', 'bluesky', 'mastodon']),
+  kind: z.enum(['demo', 'rss', 'bluesky', 'mastodon', 'archive_import']),
   label: z.string(),
   detail: z.string(),
   status: z.enum(['healthy', 'rate_limited', 'auth_required', 'transient', 'paused']),
@@ -140,6 +140,8 @@ export const SyncOutcomeSchema = z.object({
   sourceLimitReached: z.boolean(),
 });
 
+export const ArchiveImportPlatformSchema = z.enum(['x', 'instagram']);
+
 export const ConnectorDescriptorSchema = z.object({
   kind: z.enum(['rss', 'mastodon', 'bluesky']),
   label: z.string(),
@@ -179,6 +181,15 @@ export const DashboardSchema = z.object({
   }),
 });
 
+export const ArchiveImportResultSchema = z.object({
+  status: z.enum(['canceled', 'imported', 'replayed']),
+  sourceId: z.string().nullable(),
+  importedItems: z.number().int().nonnegative(),
+  skippedItems: z.number().int().nonnegative(),
+  changedItems: z.number().int().nonnegative(),
+  dashboard: DashboardSchema,
+});
+
 export type Source = z.infer<typeof SourceSchema>;
 export type DigestItem = z.infer<typeof DigestItemSchema>;
 export type Trend = z.infer<typeof TrendSchema>;
@@ -188,6 +199,8 @@ export type ModelStatus = z.infer<typeof ModelStatusSchema>;
 export type Dashboard = z.infer<typeof DashboardSchema>;
 export type SyncOutcome = z.infer<typeof SyncOutcomeSchema>;
 export type SyncSourcesResult = { dashboard: Dashboard; outcome: SyncOutcome };
+export type ArchiveImportPlatform = z.infer<typeof ArchiveImportPlatformSchema>;
+export type ArchiveImportResult = z.infer<typeof ArchiveImportResultSchema>;
 export type FeedbackSignal = 'more_like_this' | 'less_like_this' | 'not_relevant' | 'mute_source';
 
 export interface AppError {

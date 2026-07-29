@@ -28,6 +28,15 @@ describe('declared non-text contrast tokens', () => {
       ['#5b21b6', '#f4f4f5'],
       ['#ffffff', '#8b5cf6'],
       ['#8b5cf6', '#18181b'],
+      // semantic status markers against their themed surfaces
+      ['#16a34a', '#ffffff'],
+      ['#b45309', '#ffffff'],
+      ['#b91c1c', '#ffffff'],
+      ['#2563eb', '#ffffff'],
+      ['#4ade80', '#18181b'],
+      ['#fbbf24', '#18181b'],
+      ['#f87171', '#18181b'],
+      ['#60a5fa', '#18181b'],
     ] as const;
     for (const [foreground, surface] of pairs) {
       expect(contrast(foreground, surface)).toBeGreaterThanOrEqual(3);
@@ -42,6 +51,7 @@ describe('declared non-text contrast tokens', () => {
     expect(css).toContain('--brand-border: #000000');
     expect(css).toContain('--brand-disc: #ffffff');
     expect(css).toContain('--brand-fill: #8b5cf6');
+    expect(css).toContain(":root[data-theme='dark']");
     expect(css).toMatch(
       /\.brand-mark \{[\s\S]*background: var\(--brand-fill\)[\s\S]*\.brand-mark::after \{[\s\S]*background: var\(--brand-disc\)/,
     );

@@ -1,6 +1,30 @@
 # Web implementation progress
 
-Updated: 2026-07-27 — Ralph iteration 5
+Updated: 2026-07-28 — repository and web-portal reconciliation
+
+## Current-state reconciliation
+
+- Feedback-driven bounded ranking and deterministic lexical trends are active in production. Older
+  statements below that call them absent are historical, not current.
+- Package identity, cross-platform icons, MIT license metadata, `LICENSE`, and `SECURITY.md` are
+  present. Windows MSI/NSIS bundles were produced and the native app launched against a real
+  per-user SQLite database.
+- The current working tree adds bounded official X/Instagram archive import through a Rust-owned
+  native picker, with exact 20 MiB enforcement, replay/cancel handling, same-name additive
+  re-import, streaming 25,000-entry enforcement, duplicate/conflict handling, stable Instagram
+  media identity, live-sync exclusion, truthful partial health, atomic persistence, and populated
+  v12→v13 preservation/FK coverage.
+- The current working tree adapts selected `web-portal` patterns: an accessible Ctrl/Cmd+K command
+  palette, explicit Auto/Light/Dark themes, Activity-scoped vitals, source health, runner/model
+  state, responsive shell improvements, and an intentional zero-source first-run route.
+- The current working tree adds explicit original-link opening through a Rust-owned, 2 KiB,
+  credential-free HTTPS-only command. Opener link injection is disabled and the renderer capability
+  remains empty.
+- `REMAINING-WORK.md` now supersedes old iteration checklists as the canonical backlog.
+- The fully merged 2026-07-28 tree passes `pnpm verify` (40 frontend and 118 Rust tests), optimized
+  no-bundle compilation, MSI/NSIS packaging, and a controlled native-start smoke (`Responding =
+true`). Packaging still warns that `__TAURI_BUNDLE_TYPE` was not found, which remains an updater
+  release gate.
 
 ## Completed foundation
 
@@ -119,7 +143,8 @@ Round-5 artifacts: `.artifacts/reviews/round5-{security,correctness,ux,portabili
 - Stale pending receipts fail closed as command tombstones; this prevents duplicate effects but can conservatively suppress an effect that did not commit before a crash. Physical SQLite/WAL erasure remains outside logical deletion guarantees.
 - The conservative special-purpose range policy and connection pinning have unit seams but still need a deterministic mock-transport integration suite and periodic IANA review.
 - Native vault round trips, packaged hostile-content/WebView tests, macOS/Linux execution, installers, signing, notarization, SBOM, and clean-host evidence remain release gates.
-- Production trend clustering and gated learned ranking remain intentionally absent.
+- Embedding-based trends and passive/learned behavioral ranking remain intentionally absent.
+  Production lexical trends and explicit-feedback-only bounded ranking are active.
 
 ## Iteration 8 final acceptance fixes completed
 
@@ -255,8 +280,19 @@ Working directory: the repository root
 - Iteration 15 `pnpm tauri build --no-bundle`: **PASS** on Windows; release binary preserved at `src-tauri/target/release/web-social-digest.exe`.
 - Iteration 17 `pnpm verify`: **PASS** — Prettier, ESLint, TypeScript, 27 Vitest tests, Vite production build, Rust format, 67 Rust tests, and Clippy with warnings denied.
 - Iteration 17 `pnpm tauri build --no-bundle`: **PASS** on Windows; release binary preserved at `src-tauri/target/release/web-social-digest.exe`.
+- Current merged working tree `pnpm verify` on 2026-07-28: **PASS** — Prettier, ESLint,
+  TypeScript, 40 Vitest tests, Vite production build, Rust format, 118 Rust tests, and Clippy with
+  warnings denied.
+- Current merged working tree `pnpm tauri build --no-bundle` and full `pnpm tauri build`:
+  **PASS** on Windows. MSI and NSIS artifacts were produced; the full bundle emitted the recorded
+  non-fatal `__TAURI_BUNDLE_TYPE` patch warning.
+- A controlled native startup smoke remained alive and responsive until intentionally stopped.
 - No files staged or committed.
 
 ## Next step
 
-Close durable comment identity, exact prepared-set equality, and canonical complete-candidate ordering with direct reopen/retention/model-input tests; then perform one final narrow acceptance. OAuth/provider availability remains disabled and externally gated.
+Capture packaged archive-import/native-dialog and original-link smoke evidence, then close the
+remaining round-12 regression/privacy acceptance tests and activate CI. Product work should
+proceed in the order maintained in `REMAINING-WORK.md`: onboarding/OPML/feed discovery, fair
+edition history, local Search/Recall and Saved, tray lifecycle, backup/restore, then Mastodon
+before Bluesky.

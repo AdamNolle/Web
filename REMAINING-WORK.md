@@ -1,190 +1,333 @@
-# Remaining Work
+# Web: current state and remaining work
 
-_Synthesized from 5 independent audits (checklist, product, repo, release) plus adversarial re-verification of every high/blocker finding. Where a verifier refuted an auditor's claim, this document reflects the correction, not the original claim. All file:line references were checked against the tree as of 2026-07-28._
+_Last reconciled against the repository and `../web-portal` on 2026-07-28._
 
-## Where this actually stands
+This is the canonical product backlog. Older iteration notes in `progress.md`, `.ralph/`, and
+`.artifacts/` are useful historical evidence, but they are not an accurate list of what remains.
 
-Today, end to end, for a real (non-demo) user this app does exactly one thing: you paste an exact RSS/Atom feed URL, Rust fetches and normalizes it with genuinely solid safety engineering (SSRF guards, OS-vault secrets, loopback-only local LLM, WAL/FK-safe migrations), and pressing "Run digest" produces a reverse-chronological list of at most 8 items (2 per source) with mostly first-sentence summaries, because the model-backed summarizer is capped at 4 items per run. That is it. Every other headline feature is either structurally inert or entirely absent: Mastodon and Bluesky have no connector code at all (only descriptor literals), the Trends tab can never populate because production never writes a `trend_clusters` row, ranking is a literal `0.8 − index·0.04` arithmetic sequence with the More/Less feedback signals persisted but never read, there is no search/index over collected content, no way to click through to a source URL (the app has zero Tauri plugin permissions), scheduling only runs while the window is open and is off by default, and the app has never been packaged into a working installer or even launched once outside `cargo test`. The engineering quality of what exists is genuinely high and well-tested; the product surface is roughly 15% of what the README and plan imply.
+## Executive summary
 
-## 1. Finish what Codex left open
+Web is no longer just a scaffold. The core RSS-to-finite-edition path is real, local-model and
+deterministic-summary paths are real, explicit-feedback ranking and lexical trends are active, the
+process-resident scheduler is active, Windows installers have been produced, and the app has been
+launched against a real per-user database.
 
-### Round-12 findings: code-closed, acceptance NOT closed
+The largest remaining gap is product breadth, not foundation quality. A user can build a calm RSS
+digest and, in the current working tree, import official X and Instagram archives. A user still
+cannot migrate an existing feed library, search or save collected material, browse prior editions,
+leave the window while background work continues, restore a backup, or connect a live social
+account.
 
-An unreported iteration (18/19 — no worker report, checklist/progress.md not updated) genuinely fixed all three remaining Round-12 findings in code. None of the reviewer-mandated regression tests exist. `cargo test` still reports the same 67 tests as iteration 17.
+The right direction from `web-portal` is to adapt its best interaction patterns to Web's calmer
+finite-edition product. Copying its entire operations cockpit, engagement machinery, or local admin
+surface would work against Web's product and security boundaries.
 
-| Finding                                   | Code status | Evidence                                                                                                                                                                                                                                                      | Missing to actually close                                                                             |
-| ----------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Durable comment identity                  | **Fixed**   | `0012_comment_identity_ledger.sql:4-17` (append-only, cascade-only ledger); `assert_comment_id_assignments` (db.rs:1789-1814) called pre-effect at db.rs:812/839/846; `insert_comment_identities` (db.rs:1816-1839) runs before cursor UPDATE (db.rs:849→850) | Delete→reassign, retention→reassign, partial/complete, rollback, reopen tests. Migration-12 test.     |
-| Exact prepared-summary set equality       | **Fixed**   | `validate_prepared_posts` (db.rs:1929-1959) does true `BTreeSet` key-set equality + cardinality check, called db.rs:848 before any effect                                                                                                                     | Duplicate-A/missing-B test asserting zero side effects on cursor/comments/summaries/job/privacy epoch |
-| Canonical ordering of complete candidates | **Fixed**   | Both `Complete` and `Partial` branches canonicalize via `canonical_comment_order` (db.rs:1643-1657, used at 1854/1867); second canonicalization at lib.rs:546 before the model prompt                                                                         | Reversed-complete-batch test asserting stable order into model + stable commit/reopen identity        |
+## What is genuinely implemented
 
-**Action:** update `.ralph/build-web.md:52` and `progress.md:224-234` to reflect code-closed status (they currently still say these are open — the documentation underclaims here, unusually). Then write the five missing regression tests (effort: S, roughly a day) before treating this as closed. This whole item is a gate for enabling social connectors, not something the current RSS-only user is exposed to — do not prioritize it above product work unless you're about to build Mastodon.
+### Product
 
-### New risk introduced by the ledger fix — not yet reviewed
+- RSS/Atom sources with bounded conditional synchronization, retention, source health, and explicit
+  manual override.
+- Finite digest editions with per-source bounds, deterministic fallback summaries, and optional
+  schema-validated local Ollama summaries.
+- Explicit-feedback-only ranking with minimum-signal gating, a chronological/diversity reserve,
+  persisted score components, and why-shown copy.
+- Deterministic lexical trends with cross-source gating and same-source duplicate collapse.
+- Process-resident scheduling, catch-up, quiet hours, bounded runs, durable leases, and honest
+  partial/unknown outcomes. It still stops when the process exits.
+- Source deletion, feedback undo/reset, privacy-epoch invalidation, and derivative cleanup.
+- Explicit original-link opening through a Rust-owned, credential-free HTTPS-only command. The
+  renderer receives no general opener/shell permission, and unsafe or absent URLs stay copyable but
+  non-operable.
+- In the current working tree: bounded local import of official X `tweets.js`/`tweet.js` and
+  Instagram `posts_1.json` exports through a native file picker. Imports are additive, replay-safe,
+  never scheduled as live sources, capped at 20 MiB and 25,000 entries, and can be repeated under
+  the same archive name. Entries stream one at a time; exact duplicates collapse, conflicting
+  identities fail before inference, and Instagram identity uses its normalized media set. Files
+  above either bound fail explicitly rather than silently truncating.
 
-`comment_identity_ledger` stores **plaintext** `remote_id`/`post_remote_id` and is never pruned by retention or reconciliation (0012:1-3; db.rs:2035, 2394, 2421 don't touch it). A user with a 7-day retention setting keeps an unbounded, permanently growing plaintext map of every provider comment ID ever seen. This contradicts the app's own retention promise and its established pattern of avoiding raw identifiers (migration 8 precedent). Fix: either prune ledger rows in lockstep with comment/post retention, or switch to keyed fingerprints as the original reviewer suggested. Effort: S.
+### Interface
 
-### Other stale/false claims to fix immediately (all effort XS)
+- Responsive React interface with a finite natural end, visible operation state, semantic focus,
+  skip navigation, reduced-motion support, and tested light/dark contrast tokens.
+- Intentional zero-source first-run route with clear RSS/archive choices and focus routed to the
+  relevant Sources control; the generic caught-up edition remains reserved for connected sources.
+- In the current working tree, adapted from the useful parts of `web-portal`:
+  - accessible Ctrl/Cmd+K command palette for views, sources, and trends;
+  - explicit Auto/Light/Dark presentation modes;
+  - Activity-scoped vitals, runner/model state, source-health table, and chronological activity;
+  - responsive glass/purple visual system without copying the portal's global live ticker or dense
+    six-metric header.
 
-- **`pnpm verify` fails at step 1**, contradicting the checked `[x]` at build-web.md:43/124: `prettier --check` fails because `.gitignore` doesn't exclude `.tokensave/`. Every other stage (eslint, tsc, 27/27 vitest, vite build, cargo fmt, 67/67 cargo test, clippy) passes standalone. Fix: add `.tokensave/` to `.gitignore`.
-- The RSS ingest path (`ingest_posts`, db.rs:2200-2265) still uses last-wins `HashMap` collapse instead of the set-equality check applied to the neutral social path (db.rs:848). Not exploitable today (non-empty leftover map errors at 2261-2263) but is the same defect class, left un-unified. Effort: XS.
-- The working tree is provably still being written to during any audit (mid-session mtime changes on `styles.css`/`contrast.test.ts`); re-verify test results before acting on any snapshot.
+### Engineering and release foundation
 
-## 2. Make it actually useful — the product gap
+- Presentation-only renderer; Rust owns network, SQLite, files, credentials, scheduling, and model
+  access.
+- SSRF-hardened RSS transport with DNS pinning, redirect revalidation, downgrade rejection, proxy
+  bypass, response limits, and normalized canonical links.
+- Rust-owned SQLite with WAL, foreign keys, version-gated migrations, source generations, fenced
+  resident effects, replay-safe commands, and bounded retention.
+- OS-vault abstraction with no plaintext fallback and a restrictive Tauri capability baseline.
+- `LICENSE`, `SECURITY.md`, package/Cargo license metadata, real multi-platform icons, stable app
+  identifier, and Windows MSI/NSIS configuration.
+- Windows MSI and NSIS artifacts have been produced. A real database exists under
+  `%APPDATA%\io.github.adamnolle.web`, proving native setup/migrations launched outside unit tests.
+- A three-host GitHub Actions workflow exists in the working tree, but it remains untracked and has
+  no upstream run evidence yet.
 
-Ordered by user value per unit of effort. This is the section that matters most against the user's actual goal.
+## Claims that were stale
 
-| #   | Item                                                                                                                                        | Why it matters                                                                                                                                                                                 | Smallest credible increment                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Effort | External prerequisite                                                                                                                            |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1   | **Link opening** — canonical URLs render as inert `<code>` text; zero Tauri plugin permissions exist                                        | The terminal action of a summarizer — "let me go read that" — currently requires manual copy/paste. Dead end.                                                                                  | Add `tauri-plugin-opener`, scope `opener:allow-open-url` to `https?://`, render URL as a button. Reuse existing `valid_canonical_url` (connectors/mod.rs:468).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | S      | None                                                                                                                                             |
-| 2   | **First-run empty state + OPML import**                                                                                                     | New user is told "You're caught up" on zero items with no prompt to add anything; one-feed-at-a-time form doesn't scale from an existing reader                                                | Empty-state routing to Sources; `import_opml(xml)` command looping existing `add_rss_source`; feed autodiscovery from a bare site URL                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | S      | None                                                                                                                                             |
-| 3   | **Raise the digest cap / add fairness + archive**                                                                                           | Hard 8-item/2-per-source cap plus "only the single newest digest is loadable" means following >4-8 active sources silently starves the rest, and a week away discards 6 editions with no trace | Make cap a setting (10-40) with per-source fairness (guarantee 1 slot before any source gets 2); "Previous editions" view over existing `digests` rows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | S      | None                                                                                                                                             |
-| 4   | **Real ranking** — `importance` is literally `0.8 − index·0.04`; More/Less feedback is written (domain.rs:309-310) but read by zero queries | The digest never gets smarter with use; it's permanently a recency list                                                                                                                        | Additive interpretable score in `run_digest_fenced`: recency decay + bounded source-affinity count + bounded keyword-affinity count from More/Less history; persist components; use them as the real "reason" string. Keep a 25% chronological reserve (plan.md:51).                                                                                                                                                                                                                                                                                                                                                                                                            | M      | None                                                                                                                                             |
-| 5   | **Search/index over collected content**                                                                                                     | `body_text` is fully stored (up to 20k chars) but completely unreachable once it leaves an edition; with 30-day default retention this is real loss                                            | Migration adding `posts_fts` (FTS5) or a `LIKE` fallback; one `search_posts` command; a search box reusing the existing DigestCard                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | M      | None                                                                                                                                             |
-| 6   | **Lexical trend clustering** (deterministic, no embeddings/model)                                                                           | Trends is one of five nav destinations and is _permanently_ empty in production — the read path, privacy suppression, and DTOs are all fully built with zero producer                          | In `run_digest_fenced`, tokenize title+body prefix, drop stopwords, top-k terms/post, pairwise Jaccard, cluster when ≥2 posts from ≥2 _distinct_ sources exceed threshold; `cluster_method='lexical'`; confidence by distinct-source count                                                                                                                                                                                                                                                                                                                                                                                                                                      | M      | None                                                                                                                                             |
-| 7   | **Background execution (tray + close-to-hide)**                                                                                             | Core promise "digest ready when you open the app" is false today — the scheduler is a 60s in-process tick that dies when the window closes, and it's off by default                            | Add `tray-icon` Cargo feature, `TrayIconBuilder`, close-to-hide with explicit Quit; flip `schedule_enabled` default to true                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | L      | None (all local engineering)                                                                                                                     |
-| 8   | **Notifications**                                                                                                                           | No way for the app to say "an edition is ready" without the window open                                                                                                                        | `tauri-plugin-notification`, one calm notification per completed edition, gated by existing quiet-hours math (scheduler.rs:56)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | S      | None                                                                                                                                             |
-| 9   | **Mastodon connector**                                                                                                                      | This is the actual "social media" half of the product and is currently 100% absent (only descriptor literals — `connectors/mod.rs:51-90`; `db.rs:960` hard-filters `connector_kind='rss'`)     | Per-installation dynamic client registration (`POST /api/v1/apps`) — **no company, app review, or shared secret needed.** Order: (1) `tauri-plugin-opener`/shell to launch system browser, (2) migration for `oauth_sessions`, secrets to existing `OsSecretStore`, (3) `MastodonConnector` reusing the hardened RSS transport, calling `/oauth/authorize`→`/oauth/token`→`/api/v1/timelines/home`→`/api/v1/statuses/:id/context`, (4) drop the `connector_kind='rss'` literal, (5) sanitize `Status.content` HTML                                                                                                                                                              | XL     | None — realistically shippable by a solo developer                                                                                               |
-| 10  | **Bluesky connector**                                                                                                                       | Second real social source                                                                                                                                                                      | **Correction to initial audit:** an adversarial re-check found the "Blocked" framing is _not_ an overstatement — the descriptor's three stated prerequisites (public HTTPS client-metadata origin, owned native callback, exact permission validation) match the research brief's own multi-part blocker list, which also separately calls out cross-platform callback-hijack testing, full PAR/DPoP/nonce-rotation integration testing against Bluesky's entryway + an independent PDS, and 2026 scope-string validation. It is genuinely more work than "host one JSON file." Do Mastodon first; it shares the vault/session/browser-launch machinery Bluesky will also need. | XL     | One static `client-metadata.json` on a stable public HTTPS origin (e.g. GitHub Pages) — cheap but real; plus the testing/engineering scope above |
-| 11  | **Export/backup/restore**                                                                                                                   | Everything is trapped in one SQLite file with irreversible source deletion and 30-day default retention                                                                                        | `export_archive(path)` writing sources+posts+summaries+settings JSON plus an OPML file, via `tauri-plugin-dialog`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | S      | None                                                                                                                                             |
-| 12  | **Unread/saved state + "since last edition"**                                                                                               | No way to save something for later, no way to see what happened while away (only the single newest digest loads)                                                                               | Migration `post_state(post_id, read_at, saved_at)`; `mark_read`/`toggle_saved` commands; "Saved" nav view; explicit user action only (no passive dwell tracking — plan.md:14 forbids it)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | M      | None                                                                                                                                             |
-| 13  | **Hide "Conversation overview" when unavailable**                                                                                           | The section is rendered on every card and is permanently the literal string "No comments were available" for the only working connector (RSS) — a quarter of every card is dead space          | One conditional render in App.tsx; the comment-ingestion plumbing itself is solid and ready for Mastodon                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | XS     | None                                                                                                                                             |
-| 14  | **Local summarization coverage/setup friction**                                                                                             | `MAX_MODEL_ITEMS_PER_BATCH=4` (lib.rs:39) means at least half of any 8-item edition falls back to first-sentence extraction, not a summary; model selection is free-text typing, not a picker  | Show the already-fetched `api/tags` model list as a picker; add install guidance when `runtime_unavailable`; make the per-run budget time-bounded not count-bounded                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | S      | Requires Ollama installed locally (already true)                                                                                                 |
+Do not reintroduce these as open tasks:
 
-## 3. Repo publication readiness
+- Ranking is not a fixed `0.8 - index * 0.04` placeholder anymore.
+- Production trends are not inert; digest preparation writes and loads lexical clusters.
+- The local-model budget is not still the old unqualified per-item behavior; unchanged items reuse
+  summaries and inference is bounded at the whole-run level.
+- `LICENSE`, `SECURITY.md`, package license fields, icons, bundle metadata, and the non-placeholder
+  application identifier exist.
+- Windows bundles have been built and the native app has launched.
+- `src/styles.css` is valid. A compressed shell rendering made it look corrupt, but its worktree and
+  Git blob were byte-identical before the current design changes.
 
-**Correction to the original audit brief:** README.md is **not** garbled — the "missing words" were an artifact of a lossy compression layer on tool output during a prior audit, not real file corruption. Reading exact byte ranges confirms 1,319 words of clean, well-formed prose across 9 sections. Do not spend effort re-authoring for corruption that doesn't exist; the real work is re-aiming for a public audience.
+## Highest-priority remaining work
 
-**Publication blockers (must fix before any push/release):**
+### P0 — close and prove the current slice
 
-- **No LICENSE file anywhere**, and no `license` field in `package.json`, `src-tauri/Cargo.toml`, or `tauri.conf.json`. Under Berne Convention default, this repo is currently all-rights-reserved / legally un-forkable. XS effort, blocker severity.
-- **CI is red on first push, two independent reasons**, both XS/blocker:
-  - `.tokensave/` isn't gitignored → `prettier --check` (first gate in `pnpm verify`) fails on all 3 matrix OSes. Same root cause as item 1 in section 1.
-  - `.github/workflows/ci.yml:18` installs `libappindicator3-dev`, which doesn't exist on `ubuntu-24.04` (dropped after jammy; noble ships only the Ayatana fork). Also missing `libxdo-dev`, `build-essential`, `file`, `libssl-dev`. The Linux CI leg has never successfully executed.
-- **`.claude/settings.local.json` would be committed**, leaking a personal `http://127.0.0.1:8787` dev proxy endpoint. No credential, but wrong convention (should be gitignored like the sibling `.pi-subagents/`).
-- **Tauri identifier `local.web.digest`** (tauri.conf.json:5) uses a non-routable reserved TLD and determines the per-user app-data path where the SQLite DB lives. Must be changed **before** the first tagged release — changing it after any install orphans existing user databases. Pick something you control (e.g. `io.github.<user>.webdigest`).
+1. **Finish native archive-import acceptance.**
+   - Automated coverage now proves the exact file/item bounds and pre-allocation 25,001st-entry
+     abort, duplicate collapse/conflict handling, stable Instagram re-import identity, populated
+     v12-to-v13 preservation, replay/cancel behavior, same-name additive re-import, and truthful
+     partial health; the merged formatter/lint/typecheck/frontend/Rust suite is green.
+   - Exercise the native file dialog and both real official export shapes in a packaged Windows
+     build.
+   - Repeat a named archive through the real UI and confirm the expected update/skip counts and
+     absence of duplicate posts.
+   - Exercise malformed and exact-duplicate entries through the real UI and confirm the source and
+     activity surfaces retain truthful partial health; prove an over-bound file rejects without
+     source, receipt, model, or post side effects.
+   - Measure a near-limit packaged import. If the bounded operation is still too long for a calm
+     foreground action, add progress and post-selection cancellation before release.
+   - Add a repeatable native-dialog end-to-end test or retain equivalent dated manual evidence.
 
-**High-priority, not blockers:**
+2. **Close the round-12 social-foundation acceptance gaps.**
+   - Add delete-then-reassign, retention-then-reassign, partial/complete, rollback, reopen, and
+     migration-12 tests for the durable comment identity ledger.
+   - Add the duplicate-A/missing-B prepared-set regression and assert no cursor, comment, summary,
+     job, or privacy side effect.
+   - Add reversed-complete-batch coverage proving stable model input and stable identity after
+     reopen.
+   - Review whether plaintext `remote_id` and `post_remote_id` in the durable ledger are acceptable
+     under the retention promise. Prefer keyed, source-scoped fingerprints if raw provider
+     identifiers are not required for diagnostics.
 
-- No SECURITY.md (glaring given security is the product thesis and a real threat model already exists at `docs/security/threat-model.md`), no CONTRIBUTING.md (the `pnpm verify` gate chain is strict and undocumented), no CODE_OF_CONDUCT.md, no issue/PR templates, no dependabot (20+26 exact-pinned deps that will silently rot).
-- `.ralph/` vs `.artifacts/` provenance is in the worst possible half-state: `.artifacts/` (70 files, 12 review rounds — the actual evidence of scrutiny) is fully gitignored, while `.ralph/build-web.md` (the raw AI task prompt, including two home-path leaks at lines 79/121) is **not** ignored and would be committed. This broadcasts machine-authorship while hiding the diligence. Pick one posture deliberately (recommend: publish both under `docs/history/` with a framing README — the review rounds are unusually persuasive evidence).
-- 5 home-directory path leaks (`C:/Users/adamm/...`) across progress.md:238, plan.md:72, build-web.md:79/121, `.tokensave/config.json:3` — cosmetic (username disclosure only, no secrets), fixed once `.tokensave/`/`.ralph/` gitignore decisions are made.
-- Package metadata: `package.json` missing `license`/`repository`/`author`/`engines`; `Cargo.toml:5` has placeholder `authors`. Product is named three different things (`web-social-digest` npm/cargo, `"Web"` tauri productName, `Web` directory) — pick one before publishing.
-- CI hygiene: redundant pnpm version double-spec, no Rust cache (three full cold compiles per run across 3 OSes, `rusqlite` bundled-C build), no branch filter (`push`+`pull_request` double-runs same-repo PRs), no `timeout-minutes`.
-- One genuine README wording bug: line 24 "without harmless reordering" should read "without disruptive reordering." Everything else in the file is fine as prose; the actual restructuring needed is: lead with honest scope (RSS-only, Mastodon/Bluesky disabled, ranking inactive) ahead of the feature list, split several 100-167-word single bullets, add License/Screenshot/Contributing sections, inline the corrected Linux package list instead of deferring to the (currently broken) CI list.
+3. **Refresh visual evidence.**
+   - Replace `docs/media/screenshot-today.jpg`; it predates the purple/glass redesign, command
+     palette, theme control, and Activity work.
+   - Run keyboard, narrow-window, 200% zoom, reduced-motion, light, dark, empty, loading, partial,
+     and failure-state visual checks in an actual WebView.
+   - Confirm a packaged build opens an eligible HTTPS original in the default browser while HTTP,
+     credentialed, oversized, and missing URLs remain non-operable.
+   - Browser capture was unavailable during this audit, and the checked-in `web-portal/web-app` is
+     a macOS ARM64 binary, so no runtime portal comparison is claimed.
 
-**Security/PII scan: clean.** Three grep passes over all 119 commit candidates found zero real credentials/keys/tokens; the only credential-shaped strings are RFC-2606 test fixtures in redaction tests. `.gitignore` correctly excludes node_modules/target/dist/the 9.7MB tokensave DB. No huge-file risk.
+4. **Activate and prove CI.**
+   - Track/push `.github/workflows/ci.yml`.
+   - Obtain green Windows, macOS, and Ubuntu runs using the declared Node 24/Rust 1.96 toolchain.
+   - Keep the host-native `pnpm tauri build --no-bundle` leg and retain Rust caching/timeouts.
+   - Add a packaged smoke lane later; compilation alone does not attest WebView, vault, or migration
+     startup.
 
-## 4. Release and packaging
+### P1 — make Web useful every day
 
-### Blocks the owner using it daily (fix these first — all local, no money, no external approval)
+1. **Feed discovery and OPML.**
+   - Accept OPML through a Rust-owned native picker and show per-feed success/failure.
+   - Resolve a normal website URL to advertised RSS/Atom feeds through the hardened Rust network
+     boundary; do not fetch from React.
+   - Support bulk review before adding dozens of feeds.
 
-1. **`pnpm tauri build` cannot produce any installer, on any platform.** `tauri.conf.json:31-41` declares `targets: "all"` but never sets `bundle.icon`; Tauri 2 defaults that to empty, so WiX/NSIS abort with "Couldn't find a .ico icon." **Verified as a literal 6-line fix** — adding the icon array to the bundle block produced both a working `.msi` and `.exe` installer in a test run. XS effort, blocker.
-2. **The app has never been launched, on any platform, including Windows.** No `%APPDATA%\local.web.digest` directory, no `web.sqlite3` anywhere in the user profile — `setup()` (lib.rs:836-853), first-run migrations, WebView2 rendering under the restrictive CSP, and the empty-permission capability set have never executed outside `cargo test` in-memory DBs. Cheapest highest-value action available: install the NSIS output and run it once. S effort, blocker.
-3. **Scheduler dies the moment the window closes** and is off by default — see product item 7. This is the difference between "a digest reader" and "the calm background habit the product is supposed to create." L effort, blocker for the core promise (not for basic usability).
+2. **Configurable, fair editions and history.**
+   - Make edition size configurable within a calm finite range such as 10–40.
+   - Guarantee one eligible item per source before a source receives a second slot.
+   - Expose previous editions from existing digest rows, with clear generated-at and source-change
+     context.
+   - Add a concise “since your last edition” summary instead of a perpetual live ticker.
 
-### Blocks public distribution only (defer until 1-3 above are done and Mastodon/product gaps are addressed)
+3. **Search/Recall.**
+   - Add SQLite FTS5 over retained title/body/author/source text, with migration and rebuild tests.
+   - Make a Library surface for Recall results and later Saved items.
+   - Keep search local, bounded, keyboard accessible, and explicit about retention limits.
 
-- **All installers are unsigned.** Verified via `Get-AuthenticodeSignature` → `NotSigned` on the msi/exe/binary produced above. Windows needs a hardware-token-backed OV/EV cert (~$30-700/yr depending on tier) or Azure Trusted Signing (~$10/mo); SmartScreen reputation still takes time to build even after signing. macOS needs a $99/yr Developer Program membership, Developer ID cert, hardened runtime, and `notarytool`/`stapler` — without it Gatekeeper hard-blocks the .dmg. Linux needs no signing, just published SHA-256/GPG checksums (currently not even done).
-- **No macOS or Linux bundle has ever been produced** — CI only ever runs `--no-bundle`. The icon-config blocker above would fail those legs identically; the AppImage lane has additional unaddressed dependencies.
-- No updater, no single-instance plugin (two copies can run against the same SQLite file; fencing-token leases should hold data integrity but will spuriously trip recovery-path warnings), no release workflow, no SBOM/dependency/license/secret scanning pipeline, no CHANGELOG.
+4. **Saved/read-later.**
+   - Add an explicit saved state, not a passive engagement signal.
+   - Define whether saved items survive ordinary retention; if they do, make that exception visible
+     and exportable.
+   - Add Saved under Library rather than another global dashboard tab.
 
-## 5. Code health
+5. **Installed-model picker and model setup.**
+   - Surface the already queried Ollama model inventory as a picker instead of a free-text-only
+     field.
+   - Explain runtime unavailable, model missing, incompatible, unverified, and degraded states with
+     direct remediation.
+   - Keep downloads user-initiated; never silently install a runtime or model.
 
-Only items likely to cost real time, distinct from the punch-list items above:
+6. **Source lifecycle controls.**
+   - Add pause/resume, rename, and a bounded “sync/retry this source” action without requiring
+     destructive disconnect/re-add.
+   - Keep archive sources manual-only and route their equivalent action to re-import.
+   - Preserve source generations, retry eligibility, request receipts, and truthful per-source
+     health through every transition.
 
-- **Zero regression tests for three security-critical Round-12 fixes** (comment identity ledger, prepared-set equality, canonical ordering) — see section 1. This is the single largest test-debt item in the codebase; ~1 day.
-- **Plaintext comment-ID ledger that outlives retention** — new, unreviewed privacy regression from the same iteration; needs either pruning wired into retention or a switch to fingerprints. ~half a day.
-- **RSS ingest's last-wins `HashMap` collapse** (db.rs:2208-2211) is the same defect class as the fixed prepared-set-equality bug, just not unified onto the same guard. Low risk today, cheap to fix (~1 hour) before any second connector reuses `ingest_posts`.
-- CI performance/correctness (no Rust cache, duplicate PR runs, no `--locked` on cargo test/clippy) — not urgent, but will get expensive once Mastodon/Bluesky add compile time.
+7. **Backup/export/restore.**
+   - Export OPML, settings, feedback/saved state, and a versioned JSON or SQLite backup through
+     Rust-owned native dialogs.
+   - Use SQLite's online backup API or a consistent snapshot; never copy a live WAL database
+     naively.
+   - Validate restore into a temporary database, migrate it, then replace atomically with a
+     recoverable rollback path.
 
-## Recommended order of work
+8. **Tray/background lifecycle.**
+   - Add an explicit tray icon, close-to-hide preference, and true Quit action.
+   - Keep the existing Rust scheduler/lease machinery; change only process lifecycle.
+   - Verify Windows sleep/resume, duplicate-instance, battery, and clean-exit behavior before
+     enabling scheduling by default.
+   - Treat OS-level wake services as a separate later feature, not part of the first tray slice.
 
-1. **Fix `.gitignore` (`.tokensave/`) and the CI apt package list.** Why now: two independent, XS-effort reasons CI is red on the very first push; blocks everything else being demonstrably green.
-2. **Add `bundle.icon` to `tauri.conf.json` and change the Tauri identifier off `local.web.digest`.** Why now: the identifier must change before anyone installs a build — do it before step 3, not after.
-3. **Build, install, and actually launch the app once (Windows).** Why now: nothing about `setup()`, migrations, or the WebView2/CSP path has ever executed for real; this is the cheapest way to find out if the foundation actually works.
-4. **Add link-opening (`tauri-plugin-opener`).** Why now: XS/S effort, unblocks the single most obviously broken user interaction, and is a direct prerequisite for the Mastodon OAuth browser launch in step 9.
-5. **Add LICENSE + fix package/Cargo/tauri metadata (license, repo, author, engines).** Why now: legally required before any public push; trivial once you've picked a license.
-6. **First-run empty state + OPML import.** Why now: S effort, directly fixes "nobody will retype 40 feed URLs," the most obvious first-use failure.
-7. **Raise digest cap to a setting + add a "previous editions" view.** Why now: S effort, directly fixes silent source-starvation for anyone following more than a handful of feeds.
-8. **Real ranking (recency + source/keyword affinity from existing feedback tables).** Why now: M effort, makes the app's core loop (feedback → better digest) actually true for the first time; the schema and UI already assume it exists.
-9. **Tray + close-to-hide + flip `schedule_enabled` default to true.** Why now: L effort but this is the core behavioral promise ("ready when you open the app"); do it once the above stabilizes the foundation.
-10. **Lexical (non-ML) trend clustering write path.** Why now: M effort, the read path/privacy/DTOs are 100% built and idle; this turns a permanently-empty nav tab into a real feature.
-11. **Write the 5 missing Round-12 regression tests + fix the plaintext-ledger retention gap.** Why now: gates enabling any social connector safely; do before step 12.
-12. **Build the Mastodon connector.** Why now: this is the actual "social media" feature the user asked for, and per research it requires no company, app review, or legal process for a solo developer — only engineering time.
-13. **Add SECURITY.md/CONTRIBUTING.md, resolve the `.ralph`/`.artifacts` provenance split, restructure the README** (lead with honest scope, split long bullets, add screenshot). Why now: do this right before any public repo push, after the code it describes has stabilized.
-14. **Bluesky connector**, after Mastodon's OAuth/session machinery exists to reuse, and after publishing the required client-metadata JSON. Why now/last: verified to be genuinely more work than "one static file" — PAR/DPoP/nonce-rotation and cross-platform callback-hijack testing are real, non-trivial engineering, not just an external hosting step.
+9. **Item detail and source navigation.**
+   - Evolve the current inline evidence expansion into an accessible detail drawer when the added
+     context justifies it.
+   - Show provenance, summary method/uncertainty, source health, and related items without hiding
+     the canonical evidence.
+   - Preserve focus return, Escape handling, narrow-window reflow, and reduced motion.
 
-## 6. Cross-device sync, inspired by Web-Portal's git peer sync
+### P2 — live social sources
 
-The user's other project, `Web-Portal` (a Go crawler at
-`C:/Users/adamm/Desktop/Code/Web-Portal`), solves "share state across my
-own machines with no server" via `internal/sync/github.go`: each install
-gets a random instance ID, clones a user-owned git repo into
-`<data>/sync`, periodically exports newly-created rows per shared table
-into `instances/<id>/<table>.<ts>.jsonl`, commits, and pushes. Pulling
-walks every _other_ instance's subdirectory and imports rows with
-`INSERT ... ON CONFLICT DO NOTHING` keyed by a content-derived primary
-key. No server, no shared secret in the repo, conflict-free by
-construction because each instance only ever writes its own subdirectory.
-This is a good structural fit for Web: same "your data, your repo, no
-telemetry" posture, and it directly answers "I use this on more than one
-machine and want them to agree."
+1. **Mastodon first.**
+   - Dynamically register a read-only client per instance.
+   - Use PKCE, native browser authorization, bounded callback/session state, and the existing OS
+     vault.
+   - Ingest the home timeline and bounded status context with exact complete/partial provenance.
+   - Sanitize provider HTML, enforce source generation/cursor fencing, and add multi-instance
+     contract tests.
+   - Revalidate instance policy, scopes, attribution, retention, deletion, and rate limits at
+     implementation time.
 
-**One hard divergence from the Web-Portal implementation — do not port
-directly:** Web-Portal shells out to the system `git` binary
-(`os/exec.Command("git", ...)`). This codebase has `unsafe_code =
-"forbid"` in `src-tauri/Cargo.toml`, a renderer capability with zero
-granted permissions, and — per the threat model — has never spawned a
-subprocess or granted shell access in any of its twelve review rounds.
-Introducing `exec::Command` to shell out to `git`/`ssh` would be a new,
-unreviewed process-execution trust boundary exactly the kind this
-project has spent a dozen rounds avoiding. Instead:
+2. **Bluesky second.**
+   - Reuse the native browser/vault/session foundation from Mastodon.
+   - Publish stable HTTPS client metadata and own the callback origin.
+   - Implement PAR, DPoP, nonce rotation, permission validation, moderation parity, and tests
+     against entryway plus independent PDS behavior.
+   - Keep the descriptor blocked until all activation evidence exists.
 
-- Use a pure-Rust git client (the `gix` crate) speaking the smart-HTTP
-  protocol directly over the already-audited `reqwest` stack, or
-  hand-roll the minimal subset needed (fetch/push over HTTPS is a small,
-  well-documented protocol) — either way, no child process.
-- Restrict to HTTPS remotes (GitHub/GitLab/etc. token auth) rather than
-  SSH — `gix` doesn't provide fresh SSH support and matches the
-  no-subprocess constraint; a fine-grained personal access token is
-  simpler to scope and revoke than an SSH key anyway.
-- Store the sync token exactly like every other secret: through the
-  existing `OsSecretStore`/vault abstraction, fail-closed when the vault
-  is unavailable — never written to the SQLite DB or a config file.
+3. **Do not activate Reddit, X API, Meta, LinkedIn, or TikTok by implication.**
+   - Archive import is not a live connector.
+   - Each future provider needs an explicit dated access/cost/policy/retention decision.
+   - No cookie import, session replay, scraping fallback, identity rotation, or anti-bot evasion.
 
-**What should actually sync vs. stay local**, unlike Web-Portal's
-broader table list:
+### P3 — distributable releases
 
-| Safe to sync                                                               | Stays local only                                                       |
-| -------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Source list (RSS URLs; not secret)                                         | OAuth tokens/session state (vault-only, ever)                          |
-| Explicit feedback (More/Less, Not relevant)                                | Local-model selection/config (hardware differs per device)             |
-| Read/saved state (once item 12 above exists)                               | Runner/scheduler lease and owner-fencing state (per-process by design) |
-| Digest edition history/summaries (avoids re-fetch+re-summarize per device) | Activity/audit log (diagnostic, device-specific)                       |
+1. **Native evidence matrix.**
+   - Packaged launch, migration, WebView hostile-content, vault round trip, offline mode, CPU-only
+     model fallback, sleep/resume, update, and uninstall checks on Windows.
+   - Equivalent native package/runtime/keyring evidence on supported macOS and Ubuntu targets.
+   - Decide and document architectures explicitly rather than implying universal support.
 
-**Merge semantics must respect existing invariants, not just be
-idempotent:** a naive by-PK `INSERT OR IGNORE` is not sufficient here the
-way it is in Web-Portal, because this codebase already has a monotonic
-privacy epoch (migration 6) and durable deletion tombstones (migration
-5/8) specifically to stop deleted/suppressed content from reappearing.
-A peer's export of a since-deleted source or since-suppressed post must
-not resurrect it locally — imported rows need the same tombstone/epoch
-check applied to every other write path, not a bypass around it because
-the write happens to come from git instead of a sync command.
+2. **Supply chain and update path.**
+   - Lockfile-enforced builds, dependency/license/secret scans, SBOM, checksums, and provenance.
+   - Tauri updater endpoints, signed manifests, rollback behavior, and migration compatibility.
+   - Resolve the current Windows bundler warning that `__TAURI_BUNDLE_TYPE` was not found while
+     patching the binary; align/verify Tauri CLI and Rust crate behavior before updater work.
+   - Reproducible release notes that distinguish compile evidence from packaged runtime evidence.
 
-**Effort: XL, and it is a new trust boundary.** Treat it with the same
-review-round discipline as the Mastodon/Bluesky connector work (ADR,
-threat-model update, then adversarial security/correctness review)
-rather than a single-pass implementation — this is exactly the class of
-feature (new secret type, new external egress, new merge path touching
-deletion/privacy state) that this project's own process exists to catch
-before it ships.
+3. **Platform trust.**
+   - Windows Authenticode and SmartScreen reputation plan.
+   - macOS Developer ID, hardened runtime, notarization, and stapling.
+   - Linux checksums/signatures and a finite support matrix.
+   - Clean-host install/update/uninstall evidence before calling any platform “released.”
 
-## Explicitly not doing (or deferring indefinitely)
+4. **Repository publication and maintenance.**
+   - Add `CONTRIBUTING.md` with the exact `pnpm verify` and native build expectations.
+   - Add focused issue/PR templates and a dependency-update policy; enable Dependabot or Renovate
+     only with lockfile-preserving grouped updates and CI.
+   - Add frontend integration/native E2E coverage before using a coverage percentage as a gate.
+   - Decide whether a contributor code of conduct and support policy are appropriate before public
+     issue intake.
 
-- **Embeddings-based clustering / learned (ML) ranking** — the checklist item as originally scoped ("measured embeddings... interpretable learned ranking") is XL effort for uncertain gain over deterministic alternatives. Ship lexical Jaccard clustering and an interpretable additive score first (product items 4 and 6); revisit embeddings only if the deterministic version proves insufficient, and only with a locally-measured capability probe as `capabilities.rs` already gates for.
-- **Passive read-state / dwell tracking** — explicitly forbidden by plan.md:14 ("no compulsive-checking mechanics"); any unread/saved state must come from explicit user action only, never scroll/view telemetry.
-- **macOS/Linux signing and notarization work** — real money and multi-week identity verification lead times ($99/yr Apple Developer + hardware/HSM-backed Windows cert options). Do not start until the app is actually useful and has been dogfooded — signing an unfinished product wastes the lead time.
-- **A full backend/tray/battery/metered "smart" scheduler** beyond tray + close-to-hide + quiet hours (already implemented and tested in `scheduler.rs`) — true OS-level wake scheduling (Windows Task Scheduler/service, macOS `NSBackgroundActivityScheduler`, Linux systemd timer) is a platform-specific rabbit hole; the tokio in-process tick plus tray-resident process covers the "ready when you open the app" promise adequately for a single-user desktop tool.
-- **Chasing the exact "at most 4 sources" framing from the product audit** — an adversarial check found this overstates the constraint (4 is the _minimum_ sources needed to fill 8 slots at 2/source, not a ceiling; up to 8 distinct sources can appear). The underlying risk (a few active sources can crowd out the rest) is real and is addressed by making the cap a setting with fairness (item 3/7 above) — but don't design around the stronger, incorrect claim.
+## `web-portal` parity decisions
+
+| Portal pattern                 | Decision for Web                                                              | Status / next step                                                                    |
+| ------------------------------ | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Command palette                | Adapt as an accessible dialog/combobox                                        | Implemented in current working tree                                                   |
+| Auto/Light/Dark theme          | Adapt while retaining Web's purple identity                                   | Implemented in current working tree                                                   |
+| Global six-metric strip        | Scope useful metrics to Activity                                              | Implemented as Activity vitals                                                        |
+| Run timeline and source health | Adapt with truthful bounded states and table semantics                        | Source health and chronological activity baseline implemented; timeline remains later |
+| Detail drawer                  | Adapt for item evidence, provenance, source, and related items                | P1                                                                                    |
+| Recall/Saved/Notebook grouping | Use a Library surface; Recall and Saved first                                 | P1                                                                                    |
+| “Since last visit” ticker      | Convert to a finite since-last-edition summary                                | P1                                                                                    |
+| Git peer sync                  | Redesign around Rust HTTPS Git, vault secrets, conflict rules, and tombstones | Later, after backup/restore                                                           |
+| Environment/model diagnostics  | Keep in Activity/Settings, not a global identity bar                          | Baseline implemented                                                                  |
+| Dense charts/heatmaps          | Only with responsive reflow, text/table alternatives, and reduced motion      | Selectively later                                                                     |
+| Intelligence/Studio/Chat       | Keep out of the primary product until backend states are real                 | Deferred/labs only                                                                    |
+
+### Deliberately not porting
+
+- The entire 16-tab operations cockpit.
+- A perpetual global ticker or globally sticky six-metric band.
+- Agent society/chat, mastermind theater, raw widget builders, or local script execution.
+- Engagement, virality, reward, streak, urgency, or passive-behavior optimization.
+- Public unauthenticated admin APIs, wildcard CORS/WebSocket access, or a browser-exposed local
+  control plane.
+- Portal markup's mouse-first, color-only, fixed-width, and inline-style accessibility debt.
+- Semantic/embedding features that are labels or placeholders rather than verified local behavior.
+
+## Cross-device sync, later
+
+`web-portal` demonstrates a useful serverless shape: each installation writes its own append-only
+records under an instance directory in a shared Git repository and imports peer records. Web should
+not copy that implementation directly.
+
+Before implementation, define:
+
+- which entities sync (sources without credentials, settings, explicit feedback, saved items,
+  edition metadata) and which stay local (vault handles, runner leases, jobs, model cache, transient
+  health);
+- stable per-install instance IDs and monotonic cursors;
+- source deletion, feedback reset, retention, and saved-item tombstones so imports cannot resurrect
+  private data;
+- deterministic merge/conflict rules and schema-version negotiation;
+- repository size/compaction limits and recovery from force-push, partial clone, and offline edits;
+- a Rust-native HTTPS Git client or narrowly constrained helper with vault-backed credentials;
+- clear privacy copy: Git hosting is remote storage even if no Web-operated server exists.
+
+Backup/restore must ship before sync. It provides the serialization, migration, and recovery
+primitives needed to make sync safe.
+
+## Recommended execution order
+
+1. Finish and fully verify archive import plus the portal-inspired frontend slice.
+2. Close the round-12 regression/privacy evidence and activate CI.
+3. Add feed discovery and OPML import.
+4. Add pause/resume, rename, and bounded per-source sync/retry.
+5. Add fair configurable editions and previous-edition history.
+6. Add local Search/Recall, then Saved and the Library surface.
+7. Add the installed-model picker.
+8. Add item-detail/source-navigation refinements.
+9. Add backup/export/restore.
+10. Add tray/close-to-hide and native lifecycle evidence.
+11. Build and validate Mastodon.
+12. Build and validate Bluesky.
+13. Complete signing, updater, supply-chain, and clean-host release gates.
+14. Revisit peer sync only after backup/restore and privacy tombstones are proven.
+
+## Definition of done
+
+A feature is not done because a type, migration, or screen exists. It is done when:
+
+- the real native route is reachable from the UI;
+- renderer input and Rust DTOs reject malformed/unknown fields;
+- replay, cancellation, partial failure, privacy deletion, reopen, and migration behavior are
+  tested where applicable;
+- user-visible health and finality match persisted truth;
+- keyboard, focus, zoom, contrast, empty/loading/error, and narrow-layout states are covered;
+- `pnpm verify` passes from a clean checkout;
+- the relevant host-native build or packaged smoke test passes;
+- documentation describes exactly the behavior that shipped, including what remains unavailable.

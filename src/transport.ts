@@ -1,9 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import { demoDashboard } from './demoData';
 import {
+  ArchiveImportResultSchema,
   DashboardSchema,
   SettingsSchema,
   SyncOutcomeSchema,
+  type ArchiveImportPlatform,
+  type ArchiveImportResult,
   type Dashboard,
   type FeedbackSignal,
   type Settings,
@@ -18,6 +21,12 @@ export interface AppTransport {
   undoFeedback(requestId: string): Promise<Dashboard>;
   updateSettings(requestId: string, settings: Settings): Promise<Dashboard>;
   addRssSource(requestId: string, label: string, url: string): Promise<Dashboard>;
+  importArchive(
+    requestId: string,
+    platform: ArchiveImportPlatform,
+    label: string,
+  ): Promise<ArchiveImportResult>;
+  openOriginal(url: string): Promise<void>;
   deleteSource(requestId: string, sourceId: string): Promise<Dashboard>;
   resetLearning(requestId: string): Promise<Dashboard>;
 }
@@ -54,6 +63,14 @@ class TauriTransport implements AppTransport {
   }
   async addRssSource(requestId: string, label: string, url: string) {
     return parseDashboard(await invoke('add_rss_source', { request: { requestId, label, url } }));
+  }
+  async importArchive(requestId: string, platform: ArchiveImportPlatform, label: string) {
+    return ArchiveImportResultSchema.parse(
+      await invoke('import_archive', { request: { requestId, platform, label } }),
+    );
+  }
+  async openOriginal(url: string) {
+    await invoke('open_original', { request: { url } });
   }
   async deleteSource(requestId: string, sourceId: string) {
     return parseDashboard(await invoke('delete_source', { request: { requestId, sourceId } }));
@@ -178,6 +195,19 @@ class DemoTransport implements AppTransport {
       itemCount: 0,
     });
     return this.snapshot();
+  }
+  async importArchive(): Promise<ArchiveImportResult> {
+    return {
+      status: 'canceled',
+      sourceId: null,
+      importedItems: 0,
+      skippedItems: 0,
+      changedItems: 0,
+      dashboard: this.snapshot(),
+    };
+  }
+  async openOriginal(): Promise<void> {
+    throw new Error('Original links open only in the native desktop app.');
   }
   async deleteSource(_requestId: string, sourceId: string) {
     this.state.privacyEpoch += 1;

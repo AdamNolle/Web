@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::connectors::{
     CommentCompleteness, NormalizedComment, NormalizedPost, PageFinality, SourceKind,
-    SourceSyncSpec, SyncBatch, SyncPage, validate_source_sync_spec,
+    SourceSyncSpec, SyncBatch, SyncPage, export_import::MAX_IMPORT_ITEMS,
+    validate_source_sync_spec,
 };
 use crate::domain::{
     Activity, AppError, AppResult, Dashboard, DigestItem, Edition, Evidence, FeedbackSignal,
@@ -116,7 +117,8 @@ const MIGRATION_9: &str = include_str!("../migrations/0009_connector_sync_metada
 const MIGRATION_10: &str = include_str!("../migrations/0010_comment_finality_provenance.sql");
 const MIGRATION_11: &str = include_str!("../migrations/0011_comment_activation_closure.sql");
 const MIGRATION_12: &str = include_str!("../migrations/0012_comment_identity_ledger.sql");
-const LATEST_SCHEMA_VERSION: i64 = 12;
+const MIGRATION_13: &str = include_str!("../migrations/0013_export_import.sql");
+const LATEST_SCHEMA_VERSION: i64 = 13;
 
 pub struct Database {
     connection: Connection,
@@ -188,6 +190,39 @@ impl Database {
                 }
             }
             transaction.commit()?;
+        }
+        // Migration 13 rebuilds `sources` because SQLite cannot ALTER a CHECK constraint in place.
+        // `ON DELETE CASCADE` actions on `actors`/`posts`/`comments`/`source_sync_metadata` fire on
+        // `DROP TABLE sources` even with `defer_foreign_keys=ON` (that pragma only defers the
+        // orphan *check*, not the cascade *action*), which would silently delete every post and
+        // comment. Only fully disabling `foreign_keys` prevents the cascade action, and that pragma
+        // cannot be toggled inside an open transaction, so this one migration runs in its own
+        // transaction with enforcement off, isolated from the shared migration transaction above.
+        let current_before_13: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_before_13 < 13 {
+            connection.pragma_update(None, "foreign_keys", false)?;
+            {
+                let transaction = connection.unchecked_transaction()?;
+                transaction.execute_batch(MIGRATION_13)?;
+                let has_violation = {
+                    let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
+                    let mut rows = statement.query([])?;
+                    rows.next()?.is_some()
+                };
+                if has_violation {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                transaction.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES(13, ?1)",
+                    params![Utc::now().timestamp_millis()],
+                )?;
+                transaction.commit()?;
+            }
+            connection.pragma_update(None, "foreign_keys", true)?;
         }
         let mut database = Self { connection };
         database.initialize_empty_state()?;
@@ -323,6 +358,18 @@ impl Database {
             )
             .map_err(|_| AppError::internal())?;
         Ok(())
+    }
+
+    pub fn source_id_for_request(&self, request_id: &str) -> AppResult<Option<String>> {
+        validate_id(request_id)?;
+        self.connection
+            .query_row(
+                "SELECT source_id FROM receipt_sources WHERE request_id=?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::internal())
     }
 
     pub fn abort_request(&self, request_id: &str) {
@@ -733,6 +780,215 @@ impl Database {
         Ok((source_id, changed))
     }
 
+    /// Finds only archive posts whose content needs new summary preparation. Archive sources never
+    /// enter the live connector runner; repeated parts merge into the same source.
+    pub fn changed_export_import_posts(
+        &self,
+        label: &str,
+        platform: &str,
+        posts: &[NormalizedPost],
+    ) -> AppResult<Vec<NormalizedPost>> {
+        validate_source_label(label)?;
+        validate_import_platform(platform)?;
+        if posts.len() > MAX_IMPORT_ITEMS {
+            return Err(AppError::validation(
+                "The archive import exceeded the per-file item bound.",
+            ));
+        }
+        validate_unique_import_post_ids(posts)?;
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT id, config_json FROM sources
+                 WHERE connector_kind='archive_import' AND account_label=?1",
+                [label.trim()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| AppError::internal())?;
+        let Some((source_id, config)) = existing else {
+            return Ok(posts.to_vec());
+        };
+        let existing_platform = serde_json::from_str::<serde_json::Value>(&config)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("platform")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        if existing_platform.as_deref() != Some(platform) {
+            return Err(AppError::conflict(
+                "That source name is already used by a different archive platform.",
+            ));
+        }
+        let mut changed = Vec::new();
+        for post in posts {
+            let previous_hash = self
+                .connection
+                .query_row(
+                    "SELECT content_hash FROM posts
+                     WHERE source_id=?1 AND remote_id=?2 AND deleted_at IS NULL",
+                    params![source_id, post.remote_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| AppError::internal())?;
+            if previous_hash.as_deref() != Some(post_content_hash(post).as_str()) {
+                changed.push(post.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn add_export_import_source(
+        &mut self,
+        request_id: &str,
+        label: &str,
+        platform: &str,
+        posts: &[NormalizedPost],
+        skipped: usize,
+        prepared: Vec<PreparedPost>,
+    ) -> AppResult<(String, usize)> {
+        validate_id(request_id)?;
+        validate_source_label(label)?;
+        let platform_label = validate_import_platform(platform)?;
+        if posts.len() > MAX_IMPORT_ITEMS {
+            return Err(AppError::validation(
+                "The archive import exceeded the per-file item bound.",
+            ));
+        }
+        validate_unique_import_post_ids(posts)?;
+        let now = Utc::now().timestamp_millis();
+        let new_source_id = format!(
+            "import-{}",
+            &content_hash(&format!("{request_id}:{platform}:{}", label.trim()))[..20]
+        );
+        let status = if skipped > 0 { "attention" } else { "healthy" };
+        let health_state = if skipped > 0 { "transient" } else { "healthy" };
+        let page_finality = if skipped > 0 { "partial" } else { "complete" };
+        let safe_detail = if skipped > 0 {
+            format!(
+                "Imported {} of {} recognized entries; {skipped} entries were skipped because they were invalid or exact duplicates.",
+                posts.len(),
+                posts.len() + skipped
+            )
+        } else {
+            format!("Imported {} entries from this archive.", posts.len())
+        };
+        let detail = format!(
+            "Archive import - {platform_label}. One-time or periodic import from an official data export, not a live connection."
+        );
+        let config = serde_json::to_string(&serde_json::json!({ "platform": platform }))
+            .map_err(|_| AppError::internal())?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| AppError::internal())?;
+        let existing = transaction
+            .query_row(
+                "SELECT id, config_json FROM sources
+                 WHERE connector_kind='archive_import' AND account_label=?1",
+                [label.trim()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| AppError::internal())?;
+        let source_id = if let Some((source_id, existing_config)) = existing {
+            let existing_platform = serde_json::from_str::<serde_json::Value>(&existing_config)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("platform")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            if existing_platform.as_deref() != Some(platform) {
+                return Err(AppError::conflict(
+                    "That source name is already used by a different archive platform.",
+                ));
+            }
+            transaction
+                .execute(
+                    "UPDATE sources
+                     SET detail=?1, status=?2, config_json=?3, last_success_at=?4,
+                         next_poll_at=NULL, failure_count=0, updated_at=?4
+                     WHERE id=?5 AND connector_kind='archive_import'",
+                    params![detail, status, config, now, source_id],
+                )
+                .map_err(|_| AppError::internal())?;
+            source_id
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO sources(id, connector_kind, account_label, detail, status, config_json, last_success_at, next_poll_at, created_at, updated_at, generation)
+                     VALUES(?1, 'archive_import', ?2, ?3, ?4, ?5, ?6, NULL, ?6, ?6, 1)",
+                    params![
+                        new_source_id,
+                        label.trim(),
+                        detail,
+                        status,
+                        config,
+                        now
+                    ],
+                )
+                .map_err(|_| {
+                    AppError::conflict("A source with that name is already connected.")
+                })?;
+            new_source_id
+        };
+        transaction.execute(
+            "INSERT INTO source_sync_metadata(source_id, health_state, safe_detail, comments_status, comments_truncated, retry_at, updated_at, page_finality)
+             VALUES(?1, ?2, ?3, 'unavailable', 0, NULL, ?4, ?5)
+             ON CONFLICT(source_id) DO UPDATE SET
+               health_state=excluded.health_state,
+               safe_detail=excluded.safe_detail,
+               comments_status='unavailable',
+               comments_truncated=0,
+               retry_at=NULL,
+               updated_at=excluded.updated_at,
+               page_finality=excluded.page_finality",
+            params![
+                source_id,
+                health_state,
+                bounded_safe_detail(&safe_detail),
+                now,
+                page_finality
+            ],
+        ).map_err(|_| AppError::internal())?;
+        let changed = ingest_posts(&transaction, &source_id, posts, prepared, now)?;
+        set_comment_state(
+            &transaction,
+            &source_id,
+            posts,
+            CommentCompleteness::Unavailable,
+            false,
+            now,
+        )?;
+        record_import_job(&transaction, request_id, posts.len(), skipped, now)?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO receipt_sources(request_id, source_id) VALUES(?1, ?2)",
+                params![request_id, source_id],
+            )
+            .map_err(|_| AppError::internal())?;
+        let completed = transaction
+            .execute(
+                "UPDATE request_receipts
+                 SET state='complete', completed_at=?1
+                 WHERE request_id=?2 AND command='import_archive' AND state='pending'",
+                params![now, request_id],
+            )
+            .map_err(|_| AppError::internal())?;
+        if completed != 1 {
+            return Err(AppError::conflict(
+                "That archive import request is not pending.",
+            ));
+        }
+        transaction.commit().map_err(|_| AppError::internal())?;
+        Ok((source_id, changed))
+    }
+
     pub fn ingest_existing_rss(
         &mut self,
         source: &RssSourceSpec,
@@ -921,7 +1177,8 @@ impl Database {
         };
         let sql = format!(
             "SELECT id, connector_kind, generation, config_json, sync_cursor FROM sources
-             WHERE connector_kind!='demo' AND status!='paused'{due_clause} ORDER BY id LIMIT ?2"
+             WHERE connector_kind IN ('rss', 'mastodon', 'bluesky')
+               AND status!='paused'{due_clause} ORDER BY id LIMIT ?2"
         );
         let mut statement = self
             .connection
@@ -1738,10 +1995,35 @@ fn assert_runner_authority(
     })
 }
 
-fn validate_source_label(label: &str) -> AppResult<()> {
+pub(crate) fn validate_source_label(label: &str) -> AppResult<()> {
     if label.trim().is_empty() || label.chars().count() > 100 {
         return Err(AppError::validation(
             "The source label must be between 1 and 100 characters.",
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the human-readable platform label for a valid archive-import platform identifier, or a
+/// typed validation error. This is the single source of truth for which platforms are accepted.
+fn validate_import_platform(platform: &str) -> AppResult<&'static str> {
+    match platform {
+        "x" => Ok("X (Twitter) data export"),
+        "instagram" => Ok("Instagram data export"),
+        _ => Err(AppError::validation(
+            "That archive platform is not supported.",
+        )),
+    }
+}
+
+fn validate_unique_import_post_ids(posts: &[NormalizedPost]) -> AppResult<()> {
+    let mut remote_ids = BTreeSet::new();
+    if posts
+        .iter()
+        .any(|post| !remote_ids.insert(post.remote_id.as_str()))
+    {
+        return Err(AppError::validation(
+            "The archive import contains duplicate post identities.",
         ));
     }
     Ok(())
@@ -2390,6 +2672,32 @@ fn record_sync_job(
         PageFinality::Complete,
         now,
     )
+}
+
+fn record_import_job(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+    item_count: usize,
+    skipped: usize,
+    now: i64,
+) -> AppResult<()> {
+    let state = if skipped > 0 { "partial" } else { "complete" };
+    let message = if skipped > 0 {
+        format!("Archive import stored {item_count} items ({skipped} entries skipped)")
+    } else {
+        format!("Archive import stored {item_count} items")
+    };
+    transaction.execute(
+        "INSERT OR REPLACE INTO jobs(id, kind, dedupe_key, state, attempts, run_after, message, created_at, updated_at) VALUES(?1, 'import', ?2, ?3, 1, ?4, ?5, ?4, ?4)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            format!("archive-import:{request_id}"),
+            state,
+            now,
+            message
+        ],
+    ).map_err(|_| AppError::internal())?;
+    Ok(())
 }
 
 fn record_connector_sync_job(
@@ -3384,6 +3692,168 @@ mod tests {
             )
             .expect("versions");
         assert!(Database::from_connection(connection).is_err());
+    }
+
+    #[test]
+    fn v13_upgrade_preserves_populated_sources_and_foreign_keys() {
+        let connection = Connection::open_in_memory().expect("connection");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("foreign keys");
+        for (version, sql) in [
+            (1_i64, MIGRATION_1),
+            (2, MIGRATION_2),
+            (3, MIGRATION_3),
+            (4, MIGRATION_4),
+            (5, MIGRATION_5),
+            (6, MIGRATION_6),
+            (7, MIGRATION_7),
+            (8, MIGRATION_8),
+            (9, MIGRATION_9),
+            (10, MIGRATION_10),
+            (11, MIGRATION_11),
+            (12, MIGRATION_12),
+        ] {
+            connection.execute_batch(sql).expect("legacy migration");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES(?1, 0)",
+                    [version],
+                )
+                .expect("migration row");
+        }
+        connection
+            .execute(
+                "INSERT INTO sources(
+                   id, connector_kind, account_label, detail, status, config_json, created_at, updated_at
+                 ) VALUES('v12-source', 'rss', 'Preserved', 'detail', 'healthy', '{}', 1, 1)",
+                [],
+            )
+            .expect("source");
+        connection
+            .execute(
+                "INSERT INTO actors(id, source_id, remote_id, display_name)
+                 VALUES('v12-actor', 'v12-source', 'remote-actor', 'Author')",
+                [],
+            )
+            .expect("actor");
+        connection
+            .execute(
+                "INSERT INTO posts(
+                   id, source_id, remote_id, canonical_url, actor_id, title, body_text,
+                   published_at, fetched_at, content_hash
+                 ) VALUES(
+                   'v12-post', 'v12-source', 'remote-post', '', 'v12-actor', 'Title', 'Body',
+                   ?1, ?1, 'hash'
+                 )",
+                [Utc::now().timestamp_millis()],
+            )
+            .expect("post");
+        connection
+            .execute(
+                "INSERT INTO source_sync_metadata(source_id, updated_at)
+                 VALUES('v12-source', 1)",
+                [],
+            )
+            .expect("metadata");
+
+        let database = Database::from_connection(connection).expect("v13 upgrade");
+        let preserved: (i64, i64, i64, i64) = database
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM sources WHERE id='v12-source'),
+                   (SELECT COUNT(*) FROM actors WHERE id='v12-actor'),
+                   (SELECT COUNT(*) FROM posts WHERE id='v12-post'),
+                   (SELECT COUNT(*) FROM source_sync_metadata WHERE source_id='v12-source')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("preserved rows");
+        assert_eq!(preserved, (1, 1, 1, 1));
+        let version: i64 = database
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version");
+        assert_eq!(version, 13);
+        let violations: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign key check");
+        assert_eq!(violations, 0);
+        assert_eq!(
+            database
+                .connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                .expect("foreign keys enabled"),
+            1
+        );
+    }
+
+    #[test]
+    fn v13_integrity_failure_rolls_back_schema_and_version() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("v13-integrity.sqlite3");
+        {
+            let connection = Connection::open(&path).expect("connection");
+            for (version, sql) in [
+                (1_i64, MIGRATION_1),
+                (2, MIGRATION_2),
+                (3, MIGRATION_3),
+                (4, MIGRATION_4),
+                (5, MIGRATION_5),
+                (6, MIGRATION_6),
+                (7, MIGRATION_7),
+                (8, MIGRATION_8),
+                (9, MIGRATION_9),
+                (10, MIGRATION_10),
+                (11, MIGRATION_11),
+                (12, MIGRATION_12),
+            ] {
+                connection.execute_batch(sql).expect("legacy migration");
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES(?1, 0)",
+                        [version],
+                    )
+                    .expect("migration row");
+            }
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .expect("disable foreign keys for corruption fixture");
+            connection
+                .execute(
+                    "INSERT INTO actors(id, source_id, remote_id, display_name)
+                     VALUES('orphan-actor', 'missing-source', 'remote', 'Orphan')",
+                    [],
+                )
+                .expect("orphan fixture");
+        }
+
+        assert!(
+            Database::open(&path).is_err(),
+            "foreign-key violation must fail migration"
+        );
+
+        let connection = Connection::open(&path).expect("inspect rolled-back database");
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version");
+        assert_eq!(version, 12);
+        let sources_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sources'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sources definition");
+        assert!(!sources_sql.contains("archive_import"));
     }
 
     #[test]
@@ -4663,7 +5133,7 @@ mod tests {
                 row.get(0)
             })
             .expect("version");
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let social_state: (String, i64, String, String) = database.connection.query_row(
             "SELECT status, truncated, evidence_hash, summary_input_hash FROM post_comment_state WHERE post_id='post-social-v9'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -5467,6 +5937,188 @@ mod tests {
         assert_eq!(model_id.as_deref(), Some("chosen:7b@sha256:abc"));
         assert_eq!(method, "model");
         assert!(provenance.contains("input_hash") && provenance.contains("social-summary-v2"));
+    }
+
+    #[test]
+    fn archive_import_public_apis_reject_duplicate_remote_ids() {
+        let mut database = Database::memory().expect("database");
+        let duplicate = normalized("duplicate-id", "Duplicate", "Duplicate body");
+        let posts = vec![duplicate.clone(), duplicate];
+
+        let changed_error = database
+            .changed_export_import_posts("Duplicate archive", "x", &posts)
+            .expect_err("changed-post lookup must reject duplicate identities");
+        assert_eq!(changed_error.code, "VALIDATION");
+
+        assert_eq!(
+            database
+                .begin_request(
+                    "archive-duplicate-request",
+                    "import_archive",
+                    "duplicate-payload"
+                )
+                .expect("receipt"),
+            RequestDisposition::New
+        );
+        let add_error = database
+            .add_export_import_source(
+                "archive-duplicate-request",
+                "Duplicate archive",
+                "x",
+                &posts,
+                0,
+                Vec::new(),
+            )
+            .expect_err("archive persistence must reject duplicate identities");
+        assert_eq!(add_error.code, "VALIDATION");
+    }
+
+    #[test]
+    fn archive_reimport_reuses_source_and_reports_partial_health() {
+        let mut database = Database::memory().expect("database");
+        let first = normalized("archive-one", "First", "Original archive body");
+        assert_eq!(
+            database
+                .begin_request("archive-request-one", "import_archive", "payload-one")
+                .expect("first receipt"),
+            RequestDisposition::New
+        );
+        let (source_id, changed) = database
+            .add_export_import_source(
+                "archive-request-one",
+                "Ada archive",
+                "x",
+                std::slice::from_ref(&first),
+                0,
+                vec![fallback_prepared(first.clone())],
+            )
+            .expect("first import");
+        assert_eq!(changed, 1);
+        database
+            .complete_request("archive-request-one")
+            .expect("complete first import");
+
+        let updated = normalized("archive-one", "First", "Updated archive body");
+        let second = normalized("archive-two", "Second", "New archived post");
+        let posts = vec![updated.clone(), second.clone()];
+        assert_eq!(
+            database
+                .begin_request("archive-request-two", "import_archive", "payload-two")
+                .expect("second receipt"),
+            RequestDisposition::New
+        );
+        let (reused_source_id, changed) = database
+            .add_export_import_source(
+                "archive-request-two",
+                "Ada archive",
+                "x",
+                &posts,
+                3,
+                vec![fallback_prepared(updated), fallback_prepared(second)],
+            )
+            .expect("reimport");
+        assert_eq!(reused_source_id, source_id);
+        assert_eq!(changed, 2);
+        database
+            .complete_request("archive-request-two")
+            .expect("complete reimport");
+        let unchanged = database
+            .changed_export_import_posts("Ada archive", "x", &posts)
+            .expect("changed subset");
+        assert!(unchanged.is_empty());
+        assert_eq!(
+            database
+                .begin_request(
+                    "archive-request-replay-data",
+                    "import_archive",
+                    "payload-three"
+                )
+                .expect("identical receipt"),
+            RequestDisposition::New
+        );
+        let (identical_source_id, changed) = database
+            .add_export_import_source(
+                "archive-request-replay-data",
+                "Ada archive",
+                "x",
+                &posts,
+                3,
+                Vec::new(),
+            )
+            .expect("identical reimport");
+        assert_eq!(identical_source_id, source_id);
+        assert_eq!(changed, 0);
+
+        let state: (i64, i64, String, String, String) = database
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM sources WHERE connector_kind='archive_import'),
+                   (SELECT COUNT(*) FROM posts WHERE source_id=?1),
+                   s.status,
+                   m.health_state,
+                   m.page_finality
+                 FROM sources s
+                 JOIN source_sync_metadata m ON m.source_id=s.id
+                 WHERE s.id=?1",
+                [&source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("archive state");
+        assert_eq!(
+            state,
+            (
+                1,
+                2,
+                "attention".into(),
+                "transient".into(),
+                "partial".into()
+            )
+        );
+        assert_eq!(
+            database
+                .source_id_for_request("archive-request-two")
+                .expect("receipt source")
+                .as_deref(),
+            Some(source_id.as_str())
+        );
+        let (syncable, capped) = database
+            .source_sync_specs(SourceSelectionMode::ManualOverride, 0, 20)
+            .expect("sync specs");
+        assert!(syncable.is_empty());
+        assert!(!capped);
+
+        assert_eq!(
+            database
+                .begin_request(
+                    "archive-request-three",
+                    "import_archive",
+                    "different-platform"
+                )
+                .expect("third receipt"),
+            RequestDisposition::New
+        );
+        let different_platform = normalized("instagram-one", "Instagram", "Different platform");
+        let error = database
+            .add_export_import_source(
+                "archive-request-three",
+                "Ada archive",
+                "instagram",
+                std::slice::from_ref(&different_platform),
+                0,
+                vec![fallback_prepared(different_platform.clone())],
+            )
+            .expect_err("same label cannot silently change platform");
+        assert_eq!(error.code, "CONFLICT");
+        database.abort_request("archive-request-three");
     }
 
     #[test]

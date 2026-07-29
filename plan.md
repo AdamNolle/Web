@@ -17,11 +17,12 @@ Web is a single-user, read-only, local-first Tauri 2 desktop application for Win
 ## Supported-source roadmap
 
 1. **RSS/Atom:** production connector with bounded conditional sync, safe parsing, normalized attribution, and no general comment claim.
-2. **Mastodon:** official OAuth home timeline and bounded status context after native PKCE/vault/provider-policy gates pass.
-3. **Bluesky:** official AT Protocol OAuth timeline and thread context after desktop OAuth/DPoP validation.
-4. **YouTube:** later subscriptions-derived uploads/comments connector, never called personalized Home.
-5. **Reddit/X:** disabled until access, cost, retention, and commercial terms are approved.
-6. **Meta/LinkedIn/TikTok home feeds:** unsupported. No scraping fallback.
+2. **Official archive imports:** bounded, local-only X and Instagram personal-data exports. These are manual imports, never described as live connectors.
+3. **Mastodon:** official OAuth home timeline and bounded status context after native PKCE/vault/provider-policy gates pass.
+4. **Bluesky:** official AT Protocol OAuth timeline and thread context after desktop OAuth/DPoP validation.
+5. **YouTube:** later subscriptions-derived uploads/comments connector, never called personalized Home.
+6. **Reddit/X APIs:** disabled until access, cost, retention, and commercial terms are approved.
+7. **Meta/LinkedIn/TikTok home feeds:** unsupported. No scraping fallback.
 
 ## Milestones
 
@@ -32,7 +33,7 @@ Web is a single-user, read-only, local-first Tauri 2 desktop application for Win
 - Secure RSS networking with complete reserved-address handling, DNS connection pinning, downgrade rejection, replay-safe commands, conditional resync, and retention.
 - Durable scheduled sync/digest runner while the process is active, one catch-up on restart/resume, one owner-fenced recovery per instant, transaction-fenced resident side effects, and honest lifecycle copy.
 - Local-model policy with typed capability states, installed-model checks, bounded streaming responses, schema validation, per-summary provenance, and deterministic fallback.
-- Complete source deletion, privacy-epoch renderer invalidation, reset learning, export, safe original links, actionable visible errors, and accessibility/contrast fixes.
+- Complete source deletion, privacy-epoch renderer invalidation, reset learning, safe original links, actionable visible errors, and accessibility/contrast fixes.
 - Adversarial tests and one-command verification.
 
 Iteration 4 activated the process-resident portion of M1. Iteration 5 hardens it with generation-fenced source deletion, effective-representation validator binding, due-only resident selection plus typed manual override, changed-item-only model budgeting, pre/post digest attestation, renewable owner/fencing-token leases without scheduled request receipts, bounded whole runs, actual quiet-hour-aware schedule state, and a calm pending-edition renderer check. Tray/closed-app execution, export/backup/restore, cancellation, native-host attestation, and fresh post-fix acceptance review remain open M1/release work.
@@ -48,7 +49,7 @@ Iteration 4 activated the process-resident portion of M1. Iteration 5 hardens it
 
 - Deterministic lexical clustering with cross-source/origin/actor/dedup gates.
 - Optional embeddings only after exact runtime/model capability validation.
-- Explicit-feedback-only bounded learning with minimum-data gates, 25% chronological/diversity reserve, why-shown explanations, undo/pause/reset/export.
+- Explicit-feedback-only bounded learning with minimum-data gates, 25% chronological/diversity reserve, why-shown explanations, and undo/pause/reset. Export remains part of the P1 backup/export/restore slice.
 - LLMs may label validated clusters but never decide membership.
 
 ### M4 — release candidates
@@ -59,11 +60,11 @@ Iteration 4 activated the process-resident portion of M1. Iteration 5 hardens it
 
 ## Initial support matrix
 
-| Platform | Development target                                                                | Release status                                                                       |
-| -------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Windows  | Windows 10/11 x64 with Evergreen WebView2                                         | Local compile/test verified; installer/signing pending                               |
-| macOS    | Current supported macOS on the native architecture exercised by `macos-latest` CI | CI configured; additional architectures and native package/keychain evidence pending |
-| Linux    | Ubuntu 24.04 x64, WebKitGTK 4.1, desktop D-Bus Secret Service                     | CI configured; runtime/package/keyring evidence pending                              |
+| Platform | Development target                                                                | Release status                                                                     |
+| -------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Windows  | Windows 10/11 x64 with Evergreen WebView2                                         | Compile/test/native launch and unsigned MSI/NSIS verified; signing/updater pending |
+| macOS    | Current supported macOS on the native architecture exercised by `macos-latest` CI | CI workflow prepared; upstream run, native package, and keychain evidence pending  |
+| Linux    | Ubuntu 24.04 x64, WebKitGTK 4.1, desktop D-Bus Secret Service                     | CI workflow prepared; upstream runtime/package/keyring evidence pending            |
 
 Other Linux distributions are best effort until separately attested.
 

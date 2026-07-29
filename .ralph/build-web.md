@@ -49,11 +49,14 @@ Create a production-minded **Windows, macOS, and Linux** desktop app named **Web
   - [x] Run independent acceptance over iteration-15 neutral finality/provenance fixes
   - [x] Close partial-activity DTO, comment identity, secret zeroing, migration-10, state-matrix, and partial-inference findings
   - [x] Run final narrow neutral security/correctness acceptance
-  - [ ] Close durable comment identity, exact prepared-set, and complete-candidate ordering findings
+  - [x] Implement durable comment identity, exact prepared-set equality, and canonical complete-candidate ordering fixes
+  - [ ] Add the remaining round-12 delete/retention/reopen, duplicate-set, reversed-order, and ledger-privacy acceptance evidence
   - [ ] Implement vault-backed OAuth session state machine and bounded Mastodon 4.3+ connector behind validation gate
   - [ ] Implement Bluesky only after public metadata origin/callback ownership and exact permission set are available
-- [ ] Implement measured embeddings, production multi-source trend clustering, and interpretable learned ranking/reset/export
-- [ ] Implement a long-lived background schedule runner, tray behavior, quiet/battery/metered integration, backup/export, and restore
+- [x] Implement production lexical multi-source trends and interpretable explicit-feedback ranking/reset
+- [ ] Evaluate measured embeddings and add learning export only if they improve the calm local product
+- [x] Implement the bounded process-resident schedule runner and quiet hours
+- [ ] Implement tray lifecycle, battery/metered integration, backup/export, and restore
 - [x] Run round-1 independent security, correctness, UX, and portability reviews
 - [x] Apply iteration-2 RSS/IPC, persistence/privacy, and calm-UX blocker/high fix clusters
 - [x] Run round-2 independent post-fix security, correctness, UX, and portability review
@@ -94,7 +97,7 @@ Working directory for all commands: the repository root.
 - Iteration-15 neutral remediation: `.artifacts/workers/iteration15-neutral-finality-provenance.md`.
 - Iteration-15 acceptance: `.artifacts/reviews/round11-neutral-{security,correctness,ux-portability}.md`.
 - Iteration-17 neutral closure: `.artifacts/workers/iteration17-neutral-final-closure.md`.
-- Final neutral acceptance: `.artifacts/reviews/round12-neutral-{security,correctness,ux-portability}.md`; UX/portability and migration/finality/partial-path fixes pass. Acceptance remains open for durable source-wide comment identity across deletion/retention, exact prepared-candidate set equality, and canonical ordering of complete candidates.
+- Final neutral acceptance: `.artifacts/reviews/round12-neutral-{security,correctness,ux-portability}.md`; UX/portability and migration/finality/partial-path fixes pass. The three code fixes are now present, but acceptance remains open on their missing delete/retention/reopen, duplicate-set, reversed-order, and ledger-privacy regression evidence.
 - Toolchain: `rustc/cargo 1.96.0`, Node `26.4.0`, pnpm `11.3.0`; Windows WebView2 loader present.
 - `pnpm install`: passed after explicitly allowing only `esbuild`'s required install script in `pnpm-workspace.yaml`; lockfiles preserved.
 - Iteration 5 `pnpm verify`: passed. Prettier, ESLint (`--max-warnings 0`), TypeScript, 13 Vitest tests, Vite production build, `cargo fmt --check`, 39 Rust tests, and Clippy (`-D warnings`) all passed.

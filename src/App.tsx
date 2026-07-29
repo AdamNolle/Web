@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { transport } from './transport';
 import {
   SettingsSchema,
+  type ArchiveImportPlatform,
+  type ArchiveImportResult,
   type Dashboard,
   type DigestItem,
   type FeedbackSignal,
@@ -11,6 +13,15 @@ import {
 } from './types';
 
 type View = 'today' | 'trends' | 'sources' | 'activity' | 'settings';
+type ThemeMode = 'auto' | 'light' | 'dark';
+type PaletteCommand = {
+  id: string;
+  label: string;
+  detail: string;
+  view: View;
+  targetId?: string;
+};
+
 const views: Array<{ id: View; label: string }> = [
   { id: 'today', label: 'Today' },
   { id: 'trends', label: 'Trends' },
@@ -18,6 +29,8 @@ const views: Array<{ id: View; label: string }> = [
   { id: 'activity', label: 'Activity' },
   { id: 'settings', label: 'Privacy & settings' },
 ];
+
+const THEME_STORAGE_KEY = 'web.presentation.theme';
 
 const formatDate = (value: string | null) => {
   if (value === null) return 'Not yet';
@@ -34,6 +47,32 @@ const timestampLabel = (kind: 'published' | 'updated' | 'fetched') =>
 
 const requestId = () => crypto.randomUUID();
 const STATE_CHECK_MS = navigator.userAgent.includes('jsdom') ? 250 : 30_000;
+const isThemeMode = (value: string | null): value is ThemeMode =>
+  value === 'auto' || value === 'light' || value === 'dark';
+const initialThemeMode = (): ThemeMode => {
+  try {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return isThemeMode(saved) ? saved : 'auto';
+  } catch {
+    return 'auto';
+  }
+};
+const statusLabel = (value: string) => value.replaceAll('_', ' ');
+const MAX_OPENABLE_URL_BYTES = 2 * 1024;
+const canOpenOriginal = (value: string | null): value is string => {
+  if (!value || new TextEncoder().encode(value).byteLength > MAX_OPENABLE_URL_BYTES) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      Boolean(url.hostname) &&
+      url.username.length === 0 &&
+      url.password.length === 0
+    );
+  } catch {
+    return false;
+  }
+};
 
 const keepOpenEdition = (displayed: Dashboard, fresh: Dashboard): Dashboard => {
   const privacyChanged = fresh.privacyEpoch !== displayed.privacyEpoch;
@@ -79,6 +118,10 @@ function App() {
   const [undoId, setUndoId] = useState<string>();
   const [pendingDashboard, setPendingDashboard] = useState<Dashboard>();
   const [syncReport, setSyncReport] = useState<SyncOutcome>();
+  const [themeMode, setThemeMode] = useState<ThemeMode>(initialThemeMode);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState('');
+  const [activeCommandIndex, setActiveCommandIndex] = useState(0);
   const mainRef = useRef<HTMLElement>(null);
   const dashboardRef = useRef<Dashboard | undefined>(undefined);
   const pendingDashboardRef = useRef<Dashboard | undefined>(undefined);
@@ -88,6 +131,50 @@ function App() {
   const feedbackOriginRef = useRef<{ itemId: string; signal: FeedbackSignal } | undefined>(
     undefined,
   );
+  const paletteDialogRef = useRef<HTMLDivElement>(null);
+  const paletteInputRef = useRef<HTMLInputElement>(null);
+  const paletteReturnFocusRef = useRef<HTMLElement | null>(null);
+
+  useLayoutEffect(() => {
+    const media =
+      typeof window.matchMedia === 'function'
+        ? window.matchMedia('(prefers-color-scheme: dark)')
+        : undefined;
+    const applyTheme = () => {
+      document.documentElement.dataset.theme =
+        themeMode === 'auto' ? (media?.matches ? 'dark' : 'light') : themeMode;
+      document.documentElement.dataset.themeMode = themeMode;
+    };
+    applyTheme();
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    } catch {
+      // Presentation preferences are optional when storage is unavailable.
+    }
+    if (themeMode !== 'auto' || !media) return;
+    media.addEventListener('change', applyTheme);
+    return () => media.removeEventListener('change', applyTheme);
+  }, [themeMode]);
+
+  const openCommandPalette = useCallback(() => {
+    if (!dashboardRef.current) return;
+    paletteReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setPaletteQuery('');
+    setActiveCommandIndex(0);
+    setPaletteOpen(true);
+  }, []);
+
+  const closeCommandPalette = useCallback((restoreFocus = true) => {
+    setPaletteOpen(false);
+    setPaletteQuery('');
+    setActiveCommandIndex(0);
+    const returnTarget = paletteReturnFocusRef.current;
+    paletteReturnFocusRef.current = null;
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => returnTarget?.focus());
+    }
+  }, []);
 
   const acceptsDashboard = useCallback((fresh: Dashboard) => {
     const installedEpoch = Math.max(
@@ -108,7 +195,7 @@ function App() {
       if (acceptsDashboard(fresh)) {
         dashboardRef.current = fresh;
         setDashboard(fresh);
-        setNotice('Edition ready');
+        setNotice(fresh.sources.length === 0 ? 'Ready to add your first source' : 'Edition ready');
       }
     } catch (error) {
       setLoadFailed(true);
@@ -168,6 +255,29 @@ function App() {
   useEffect(() => {
     if (undoId) undoButtonRef.current?.focus();
   }, [undoId]);
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        if (paletteOpen) closeCommandPalette();
+        else openCommandPalette();
+        return;
+      }
+      if (event.key === 'Escape' && paletteOpen) {
+        event.preventDefault();
+        closeCommandPalette();
+      }
+    };
+    document.addEventListener('keydown', handleShortcut);
+    return () => document.removeEventListener('keydown', handleShortcut);
+  }, [closeCommandPalette, openCommandPalette, paletteOpen]);
+
+  useEffect(() => {
+    if (!paletteOpen) return;
+    const frame = window.requestAnimationFrame(() => paletteInputRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [paletteOpen]);
 
   const perform = async (
     label: string,
@@ -263,17 +373,157 @@ function App() {
     if (saved) setUndoId(id);
   };
 
+  const openOriginal = async (url: string) => {
+    if (busy) return;
+    setBusy(true);
+    setOperationFailed(false);
+    setOperationErrorTarget(undefined);
+    setNotice('Opening original source…');
+    try {
+      await transport.openOriginal(url);
+      setNotice('Original source opened in your default browser.');
+    } catch (error) {
+      setOperationFailed(true);
+      setNotice(
+        safeErrorMessage(
+          error,
+          'The original source could not be opened safely. You can still copy its URL.',
+        ),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const importArchive = async (
+    platform: ArchiveImportPlatform,
+    label: string,
+  ): Promise<boolean> => {
+    let result: ArchiveImportResult | undefined;
+    const platformLabel = platform === 'x' ? 'X' : 'Instagram';
+    const finished = await perform(`Opening the ${platformLabel} archive picker`, async () => {
+      result = await transport.importArchive(requestId(), platform, label);
+      return result.dashboard;
+    });
+    if (!finished || !result) return false;
+
+    if (result.status === 'canceled') {
+      setNotice('Archive import canceled. No local data changed.');
+      return false;
+    }
+    if (result.status === 'replayed') {
+      setNotice('That archive import was already completed; no data was imported twice.');
+      return true;
+    }
+
+    const skipped =
+      result.skippedItems > 0
+        ? ` ${result.skippedItems} invalid or exact duplicate entries were skipped.`
+        : '';
+    setNotice(
+      `Imported ${result.importedItems} ${platformLabel} posts; ${result.changedItems} local items changed.${skipped}`,
+    );
+    return true;
+  };
+
+  const openSourcesControl = (controlId: 'rss-label' | 'archive-platform') => {
+    setView('sources');
+    window.requestAnimationFrame(() => document.getElementById(controlId)?.focus());
+  };
+
+  const paletteCommands: PaletteCommand[] = [
+    ...views.map(({ id, label }) => ({
+      id: `view-${id}`,
+      label,
+      detail: 'View',
+      view: id,
+    })),
+    ...(dashboard?.sources ?? []).map((source) => ({
+      id: `source-${source.id}`,
+      label: source.label,
+      detail: `Source · ${statusLabel(source.status)}`,
+      view: 'sources' as const,
+      targetId: `source-card-${source.id}`,
+    })),
+    ...(dashboard?.trends ?? []).map((trend) => ({
+      id: `trend-${trend.id}`,
+      label: trend.label,
+      detail: `Trend · ${trend.sourceCount} independent sources`,
+      view: 'trends' as const,
+      targetId: `trend-card-${trend.id}`,
+    })),
+  ];
+  const normalizedPaletteQuery = paletteQuery.trim().toLocaleLowerCase();
+  const filteredPaletteCommands = paletteCommands.filter((command) =>
+    `${command.label} ${command.detail}`.toLocaleLowerCase().includes(normalizedPaletteQuery),
+  );
+  const selectedCommandIndex = Math.min(
+    activeCommandIndex,
+    Math.max(filteredPaletteCommands.length - 1, 0),
+  );
+
+  const activatePaletteCommand = (command: PaletteCommand) => {
+    closeCommandPalette(false);
+    setView(command.view);
+    window.requestAnimationFrame(() => {
+      const target = command.targetId ? document.getElementById(command.targetId) : null;
+      (target ?? mainRef.current?.querySelector<HTMLElement>('h1'))?.focus();
+    });
+  };
+
+  const handlePaletteKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setActiveCommandIndex((current) =>
+        filteredPaletteCommands.length === 0 ? 0 : (current + 1) % filteredPaletteCommands.length,
+      );
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setActiveCommandIndex((current) =>
+        filteredPaletteCommands.length === 0
+          ? 0
+          : (current - 1 + filteredPaletteCommands.length) % filteredPaletteCommands.length,
+      );
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      const command = filteredPaletteCommands[selectedCommandIndex];
+      if (command) activatePaletteCommand(command);
+    }
+  };
+
+  const trapPaletteFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Tab') return;
+    const focusable = paletteDialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    if (!focusable || focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last?.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first?.focus();
+    }
+  };
+
   if (!dashboard) {
     return (
-      <main className="loading" aria-live="polite">
-        <div className="brand-mark" aria-hidden="true" />
-        <p>{notice}</p>
-        {loadFailed && (
-          <button className="primary" onClick={() => void loadDashboard()}>
-            Retry local load
-          </button>
-        )}
-      </main>
+      <>
+        <a className="skip-link" href="#main-content">
+          Skip to content
+        </a>
+        <main id="main-content" className="loading" aria-live="polite" tabIndex={-1}>
+          <div className="brand-mark" aria-hidden="true" />
+          <p>{notice}</p>
+          {loadFailed && (
+            <button className="primary" onClick={() => void loadDashboard()}>
+              Retry local load
+            </button>
+          )}
+        </main>
+      </>
     );
   }
 
@@ -304,6 +554,25 @@ function App() {
             </button>
           ))}
         </nav>
+        <button className="command-trigger" type="button" onClick={openCommandPalette}>
+          <span>Search &amp; commands</span>
+          <kbd>Ctrl/⌘ K</kbd>
+        </button>
+        <fieldset className="theme-control" role="radiogroup" aria-label="Theme">
+          <legend>Appearance</legend>
+          {(['auto', 'light', 'dark'] as const).map((mode) => (
+            <label key={mode}>
+              <input
+                type="radio"
+                name="theme-mode"
+                value={mode}
+                checked={themeMode === mode}
+                onChange={() => setThemeMode(mode)}
+              />
+              <span>{mode === 'auto' ? 'Auto' : mode === 'light' ? 'Light' : 'Dark'}</span>
+            </label>
+          ))}
+        </fieldset>
         <div className="privacy-badge">
           <span className="status-dot healthy" />
           Local-only inference
@@ -370,6 +639,9 @@ function App() {
             }
             onSync={() => void performSync()}
             onFeedback={sendFeedback}
+            onOpenOriginal={(url) => void openOriginal(url)}
+            onAddSource={() => openSourcesControl('rss-label')}
+            onImportArchive={() => openSourcesControl('archive-platform')}
           />
         )}
         {view === 'trends' && <Trends dashboard={dashboard} />}
@@ -384,6 +656,7 @@ function App() {
                 'rss-url',
               )
             }
+            onImport={importArchive}
             statusMessage={notice}
             statusIsError={operationFailed && operationErrorTarget === 'rss-url'}
             onDelete={(source) =>
@@ -417,6 +690,86 @@ function App() {
           />
         )}
       </main>
+
+      {paletteOpen && (
+        <div
+          className="command-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeCommandPalette();
+          }}
+        >
+          <div
+            ref={paletteDialogRef}
+            className="command-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="command-palette-title"
+            onKeyDown={trapPaletteFocus}
+          >
+            <div className="command-dialog-header">
+              <div>
+                <p className="eyebrow">Quick navigation</p>
+                <h2 id="command-palette-title">Command palette</h2>
+              </div>
+              <button
+                className="secondary command-close"
+                type="button"
+                onClick={() => closeCommandPalette()}
+              >
+                Close
+              </button>
+            </div>
+            <label className="command-search" htmlFor="command-palette-input">
+              <span className="sr-only">Search commands</span>
+              <input
+                ref={paletteInputRef}
+                id="command-palette-input"
+                role="combobox"
+                aria-label="Search commands"
+                aria-autocomplete="list"
+                aria-expanded="true"
+                aria-controls="command-palette-results"
+                aria-activedescendant={
+                  filteredPaletteCommands.length > 0
+                    ? `palette-option-${filteredPaletteCommands[selectedCommandIndex]?.id}`
+                    : undefined
+                }
+                value={paletteQuery}
+                placeholder="Search views, sources, and trends"
+                onChange={(event) => {
+                  setPaletteQuery(event.target.value);
+                  setActiveCommandIndex(0);
+                }}
+                onKeyDown={handlePaletteKeyDown}
+              />
+            </label>
+            <ul id="command-palette-results" className="command-results" role="listbox">
+              {filteredPaletteCommands.map((command, index) => (
+                <li
+                  id={`palette-option-${command.id}`}
+                  key={command.id}
+                  role="option"
+                  aria-selected={index === selectedCommandIndex}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseMove={() => setActiveCommandIndex(index)}
+                  onClick={() => activatePaletteCommand(command)}
+                >
+                  <span>{command.label}</span>
+                  <small>{command.detail}</small>
+                </li>
+              ))}
+              {filteredPaletteCommands.length === 0 && (
+                <li className="command-empty" role="status">
+                  No matching views, sources, or trends.
+                </li>
+              )}
+            </ul>
+            <p className="command-help">
+              Use arrow keys to move, Enter to open, and Escape to close.
+            </p>
+          </div>
+        </div>
+      )}
 
       {undoId && (
         <div className="undo" role="status">
@@ -470,13 +823,64 @@ function Today({
   onRefresh,
   onSync,
   onFeedback,
+  onOpenOriginal,
+  onAddSource,
+  onImportArchive,
 }: {
   dashboard: Dashboard;
   busy: boolean;
   onRefresh: () => void;
   onSync: () => void;
   onFeedback: (itemId: string, signal: FeedbackSignal) => void;
+  onOpenOriginal: (url: string) => void;
+  onAddSource: () => void;
+  onImportArchive: () => void;
 }) {
+  if (dashboard.sources.length === 0) {
+    return (
+      <>
+        <PageHeader
+          eyebrow="Private by default"
+          title="Choose your first source."
+          detail="Web builds finite editions only from sources you deliberately add. Source data, summaries, and feedback stay in this app’s local data."
+        />
+        <section className="first-run" aria-labelledby="first-run-title">
+          <div className="first-run-copy">
+            <p className="eyebrow">Nothing is connected yet</p>
+            <h2 id="first-run-title">Start with a source you trust.</h2>
+            <p>
+              Add a public RSS or Atom feed for bounded read-only updates, or select an official
+              personal-data archive already on this computer. Web never posts, follows, likes, or
+              asks for account passwords.
+            </p>
+            <div className="first-run-actions">
+              <button className="primary" type="button" onClick={onAddSource}>
+                Add an RSS feed
+              </button>
+              <button className="secondary" type="button" onClick={onImportArchive}>
+                Import an official archive
+              </button>
+            </div>
+          </div>
+          <dl className="first-run-boundaries">
+            <div>
+              <dt>Local processing</dt>
+              <dd>Summaries and ranking run locally, with a deterministic fallback.</dd>
+            </div>
+            <div>
+              <dt>Read-only access</dt>
+              <dd>Connected sources cannot change or publish to your accounts.</dd>
+            </div>
+            <div>
+              <dt>Deliberate imports</dt>
+              <dd>Only the official archive file you choose is read.</dd>
+            </div>
+          </dl>
+        </section>
+      </>
+    );
+  }
+
   return (
     <>
       <PageHeader
@@ -524,6 +928,7 @@ function Today({
               featured={index === 0}
               busy={busy}
               onFeedback={onFeedback}
+              onOpenOriginal={onOpenOriginal}
             />
           ))}
         </div>
@@ -547,11 +952,13 @@ function DigestCard({
   featured,
   busy,
   onFeedback,
+  onOpenOriginal,
 }: {
   item: DigestItem;
   featured: boolean;
   busy: boolean;
   onFeedback: (itemId: string, signal: FeedbackSignal) => void;
+  onOpenOriginal: (url: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const evidenceId = useId();
@@ -598,12 +1005,27 @@ function DigestCard({
                 {formatDate(evidence.publishedAt)}
                 <br />
                 {evidence.canonicalUrl ? (
-                  <>
+                  <div className="source-url-actions">
                     <code>{evidence.canonicalUrl}</code>
-                    <span className="source-url-note">
-                      Copyable source URL; external opening is not enabled.
-                    </span>
-                  </>
+                    {canOpenOriginal(evidence.canonicalUrl) ? (
+                      <button
+                        type="button"
+                        className="text-button original-link-button"
+                        disabled={busy}
+                        aria-label={`Open original for ${item.title} from ${evidence.source}`}
+                        onClick={() => {
+                          const url = evidence.canonicalUrl;
+                          if (canOpenOriginal(url)) onOpenOriginal(url);
+                        }}
+                      >
+                        Open original
+                      </button>
+                    ) : (
+                      <span className="source-url-note">
+                        Copyable source URL; only credential-free HTTPS originals can be opened.
+                      </span>
+                    )}
+                  </div>
                 ) : (
                   <span>No canonical web URL was supplied.</span>
                 )}
@@ -671,7 +1093,12 @@ function Trends({ dashboard }: { dashboard: Dashboard }) {
           </p>
         )}
         {dashboard.trends.map((trend) => (
-          <article className="trend-card" key={trend.id}>
+          <article
+            id={`trend-card-${trend.id}`}
+            className="trend-card"
+            key={trend.id}
+            tabIndex={-1}
+          >
             <div>
               <span className={`confidence ${trend.confidence}`}>{trend.confidence}</span>
               <span>
@@ -709,6 +1136,7 @@ function Sources({
   dashboard,
   busy,
   onAdd,
+  onImport,
   onDelete,
   statusMessage,
   statusIsError,
@@ -716,12 +1144,15 @@ function Sources({
   dashboard: Dashboard;
   busy: boolean;
   onAdd: (label: string, url: string) => Promise<boolean>;
+  onImport: (platform: ArchiveImportPlatform, label: string) => Promise<boolean>;
   onDelete: (source: Source) => void;
   statusMessage: string;
   statusIsError: boolean;
 }) {
   const [label, setLabel] = useState('');
   const [url, setUrl] = useState('');
+  const [importPlatform, setImportPlatform] = useState<ArchiveImportPlatform>('x');
+  const [importLabel, setImportLabel] = useState('My X archive');
   return (
     <>
       <PageHeader
@@ -783,6 +1214,64 @@ function Sources({
           {statusMessage}
         </p>
       </form>
+      <section className="archive-import-section" aria-labelledby="archive-import-title">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Private history</p>
+            <h2 id="archive-import-title">Import an official data archive</h2>
+          </div>
+          <p>Local file · no upload</p>
+        </div>
+        <p className="hint">
+          Bring your own posts from an official X or Instagram export into Web. Rust reads only the
+          file you choose, accepts at most 20 MiB and 25,000 entries per import, and never uploads
+          it. Re-import the same named archive later to add or update posts.
+        </p>
+        <form
+          className="add-source archive-import"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onImport(importPlatform, importLabel);
+          }}
+        >
+          <div>
+            <label htmlFor="archive-platform">Archive platform</label>
+            <select
+              id="archive-platform"
+              value={importPlatform}
+              onChange={(event) => {
+                const platform = event.target.value as ArchiveImportPlatform;
+                setImportPlatform(platform);
+                setImportLabel(platform === 'x' ? 'My X archive' : 'My Instagram archive');
+              }}
+            >
+              <option value="x">X (Twitter)</option>
+              <option value="instagram">Instagram</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="archive-label">Archive name</label>
+            <input
+              id="archive-label"
+              required
+              maxLength={100}
+              value={importLabel}
+              onChange={(event) => setImportLabel(event.target.value)}
+            />
+            <span className="field-message compact">
+              Use the same name for later imports from this archive.
+            </span>
+          </div>
+          <button className="primary" disabled={busy}>
+            Choose archive file
+          </button>
+          <p className="archive-file-help">
+            {importPlatform === 'x'
+              ? 'Choose data/tweets.js (or tweet.js) from the extracted X archive.'
+              : 'Choose posts_1.json from your extracted Instagram activity archive.'}
+          </p>
+        </form>
+      </section>
       <section aria-labelledby="official-connectors-title">
         <h2 id="official-connectors-title">Official social connectors</h2>
         <p className="hint">
@@ -822,7 +1311,12 @@ function Sources({
           <p className="empty-state">No sources are connected yet. Add a read-only feed above.</p>
         )}
         {dashboard.sources.map((source) => (
-          <article className="source-card" key={source.id}>
+          <article
+            id={`source-card-${source.id}`}
+            className="source-card"
+            key={source.id}
+            tabIndex={-1}
+          >
             <div className="source-icon" aria-hidden="true">
               {source.kind.slice(0, 1).toUpperCase()}
             </div>
@@ -831,19 +1325,27 @@ function Sources({
                 <h2>{source.label}</h2>
                 <span className={`source-status ${source.status}`}>
                   <span className={`status-dot ${source.status}`} />
-                  {source.status}
+                  {statusLabel(source.status)}
                 </span>
               </div>
               <p>{source.detail}</p>
               {source.healthDetail && <p className="hint">{source.healthDetail}</p>}
               <dl>
                 <div>
-                  <dt>Last sync</dt>
+                  <dt>{source.kind === 'archive_import' ? 'Imported' : 'Last sync'}</dt>
                   <dd>{formatDate(source.lastSync)}</dd>
                 </div>
                 <div>
-                  <dt>Next eligible poll / retry</dt>
-                  <dd>{source.nextSync === null ? 'Eligible now' : formatDate(source.nextSync)}</dd>
+                  <dt>
+                    {source.kind === 'archive_import' ? 'Refresh' : 'Next eligible poll / retry'}
+                  </dt>
+                  <dd>
+                    {source.kind === 'archive_import'
+                      ? 'Manual re-import only'
+                      : source.nextSync === null
+                        ? 'Eligible now'
+                        : formatDate(source.nextSync)}
+                  </dd>
                 </div>
                 <div>
                   <dt>Stored items</dt>
@@ -858,7 +1360,7 @@ function Sources({
                   </dd>
                 </div>
                 <div>
-                  <dt>Last page</dt>
+                  <dt>{source.kind === 'archive_import' ? 'Import result' : 'Last page'}</dt>
                   <dd>
                     {source.syncFinality === 'partial' ? 'Partial · more may remain' : 'Complete'}
                   </dd>
@@ -871,13 +1373,17 @@ function Sources({
               onClick={() => {
                 if (
                   window.confirm(
-                    `Delete ${source.label} and all of its local posts, summaries, feedback, and credentials? This cannot be undone.`,
+                    source.kind === 'archive_import'
+                      ? `Delete ${source.label} and all locally imported posts, summaries, and feedback? This cannot be undone.`
+                      : `Delete ${source.label} and all of its local posts, summaries, feedback, and credentials? This cannot be undone.`,
                   )
                 )
                   onDelete(source);
               }}
             >
-              Disconnect & delete
+              {source.kind === 'archive_import'
+                ? 'Delete import & local data'
+                : 'Disconnect & delete'}
             </button>
           </article>
         ))}
@@ -898,6 +1404,19 @@ function Sources({
 }
 
 function Activity({ dashboard }: { dashboard: Dashboard }) {
+  const healthySources = dashboard.sources.filter((source) => source.status === 'healthy').length;
+  const pausedSources = dashboard.sources.filter((source) => source.status === 'paused').length;
+  const attentionSources = dashboard.sources.length - healthySources - pausedSources;
+  const runnerState = dashboard.runner.inFlight
+    ? 'Running now'
+    : dashboard.runner.active
+      ? `Ready · ${statusLabel(dashboard.runner.lastOutcome)}`
+      : 'Inactive';
+  const modelState =
+    dashboard.model.state === 'ready'
+      ? dashboard.model.model
+      : `Fallback · ${statusLabel(dashboard.model.state)}`;
+
   return (
     <>
       <PageHeader
@@ -905,25 +1424,175 @@ function Activity({ dashboard }: { dashboard: Dashboard }) {
         title="Activity."
         detail="A concise local history of sync, model, and schedule work. Post text, prompts, credentials, and private URLs are never logged here."
       />
-      <ol className="activity-list">
-        {dashboard.activity.length === 0 && (
-          <li className="empty-state">No local sync or digest activity has run yet.</li>
-        )}
-        {dashboard.activity.map((entry) => (
-          <li key={entry.id}>
-            <span className={`activity-marker ${entry.status}`} aria-hidden="true" />
+      <section className="activity-overview" aria-labelledby="activity-overview-title">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Current local state</p>
+            <h2 id="activity-overview-title">System snapshot</h2>
+          </div>
+          <p>Visible only on this computer</p>
+        </div>
+        <dl className="activity-vitals">
+          <div>
+            <dt>Connected sources</dt>
+            <dd>{dashboard.sources.length}</dd>
+            <small>{healthySources} healthy</small>
+          </div>
+          <div>
+            <dt>Need attention</dt>
+            <dd>{attentionSources}</dd>
+            <small>{pausedSources} paused</small>
+          </div>
+          <div>
+            <dt>Resident runner</dt>
+            <dd>{runnerState}</dd>
+            <small>{formatDate(dashboard.runner.nextScheduledAt)}</small>
+          </div>
+          <div>
+            <dt>Local summary path</dt>
+            <dd>{modelState}</dd>
+            <small>{dashboard.model.provider}</small>
+          </div>
+        </dl>
+      </section>
+
+      <section className="activity-system-grid" aria-label="Runner and model status">
+        <article className="activity-panel">
+          <div className="activity-panel-heading">
             <div>
-              <strong>{entry.message}</strong>
-              <span>
-                {entry.kind} · {formatDate(entry.occurredAt)}
-              </span>
+              <p className="eyebrow">Resident work</p>
+              <h2>Runner</h2>
             </div>
-            <span className={`activity-state ${entry.status}`}>
-              {entry.status === 'partial' ? 'partial · more may remain' : entry.status}
+            <span className={`activity-state ${dashboard.runner.lastOutcome}`}>{runnerState}</span>
+          </div>
+          <dl className="activity-detail-list">
+            <div>
+              <dt>Last attempt</dt>
+              <dd>{formatDate(dashboard.runner.lastAttemptAt)}</dd>
+            </div>
+            <div>
+              <dt>Last success</dt>
+              <dd>{formatDate(dashboard.runner.lastSuccessAt)}</dd>
+            </div>
+            <div>
+              <dt>Next eligible run</dt>
+              <dd>{formatDate(dashboard.runner.nextScheduledAt)}</dd>
+            </div>
+          </dl>
+          <p className="hint">{dashboard.runner.detail}</p>
+        </article>
+
+        <article className="activity-panel">
+          <div className="activity-panel-heading">
+            <div>
+              <p className="eyebrow">Local inference</p>
+              <h2>Model path</h2>
+            </div>
+            <span className={`model-state ${dashboard.model.state}`}>
+              {statusLabel(dashboard.model.state)}
             </span>
-          </li>
-        ))}
-      </ol>
+          </div>
+          <dl className="activity-detail-list">
+            <div>
+              <dt>Provider</dt>
+              <dd>{dashboard.model.provider}</dd>
+            </div>
+            <div>
+              <dt>Selected model</dt>
+              <dd>{dashboard.model.model ?? 'Deterministic fallback'}</dd>
+            </div>
+            <div>
+              <dt>Fallback</dt>
+              <dd>{dashboard.model.fallbackAvailable ? 'Available' : 'Unavailable'}</dd>
+            </div>
+          </dl>
+          <p className="hint">{dashboard.model.detail}</p>
+        </article>
+      </section>
+
+      <section className="source-health" aria-labelledby="source-health-title">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Read-only connections</p>
+            <h2 id="source-health-title">Source health</h2>
+          </div>
+          <p>{dashboard.sources.length} connected</p>
+        </div>
+        <div className="table-scroll">
+          <table className="source-health-table">
+            <caption className="sr-only">
+              Current health, item count, and synchronization timing for connected sources
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Source</th>
+                <th scope="col">Status</th>
+                <th scope="col">Items</th>
+                <th scope="col">Last sync</th>
+                <th scope="col">Next eligible</th>
+              </tr>
+            </thead>
+            <tbody>
+              {dashboard.sources.map((source) => (
+                <tr key={source.id}>
+                  <th scope="row">{source.label}</th>
+                  <td>
+                    <span className={`source-status ${source.status}`}>
+                      <span className={`status-dot ${source.status}`} aria-hidden="true" />
+                      {statusLabel(source.status)}
+                    </span>
+                  </td>
+                  <td>{source.itemCount}</td>
+                  <td>{formatDate(source.lastSync)}</td>
+                  <td>
+                    {source.kind === 'archive_import'
+                      ? 'Manual re-import only'
+                      : source.nextSync === null
+                        ? 'Eligible now'
+                        : formatDate(source.nextSync)}
+                  </td>
+                </tr>
+              ))}
+              {dashboard.sources.length === 0 && (
+                <tr>
+                  <td colSpan={5}>No connected sources to report.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section aria-labelledby="activity-history-title">
+        <div className="section-heading activity-history-heading">
+          <div>
+            <p className="eyebrow">Most recent first</p>
+            <h2 id="activity-history-title">Chronological activity</h2>
+          </div>
+          <p>{dashboard.activity.length} local events</p>
+        </div>
+        <ol className="activity-list">
+          {dashboard.activity.length === 0 && (
+            <li className="empty-state">No local sync or digest activity has run yet.</li>
+          )}
+          {dashboard.activity.map((entry) => (
+            <li key={entry.id}>
+              <span className={`activity-marker ${entry.status}`} aria-hidden="true" />
+              <div>
+                <strong>{entry.message}</strong>
+                <span>
+                  {entry.kind} · {formatDate(entry.occurredAt)}
+                </span>
+              </div>
+              <span className={`activity-state ${entry.status}`}>
+                {entry.status === 'partial'
+                  ? 'partial · more may remain'
+                  : statusLabel(entry.status)}
+              </span>
+            </li>
+          ))}
+        </ol>
+      </section>
     </>
   );
 }

@@ -1,0 +1,18 @@
+window.YTD.tweets.part0 = [
+  {
+    "tweet": {
+      "id_str": "1000000000000000001",
+      "full_text": "This is my first archived tweet, quite short and boring.",
+      "created_at": "Wed Oct 10 20:19:24 +0000 2018"
+    }
+  },
+  {
+    "id_str": "1000000000000000002",
+    "full_text": "Second tweet has no created_at at all, so it should fall back honestly."
+  },
+  {
+    "tweet": {
+      "favorite_count": "3"
+    }
+  }
+];

@@ -13,14 +13,12 @@
 </p>
 
 <p align="center">
-  <img alt="Status: foundation MVP" src="https://img.shields.io/badge/status-foundation_MVP-5b21b6">
+  <img alt="Status: local alpha" src="https://img.shields.io/badge/status-local_alpha-5b21b6">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-black">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-black">
 </p>
 
-<p align="center">
-  <img src="docs/media/screenshot-today.jpg" alt="Web's Today view, showing a finite morning edition" width="820">
-</p>
+<!-- Replace the pre-redesign screenshot with a fresh native WebView capture before public release. -->
 
 ## Why this exists
 
@@ -44,25 +42,28 @@ scroll engineered to keep you there.
 ## What actually works today
 
 This README describes the current, honest state — not the plan. The
-architecture below has been through twelve independent rounds of adversarial
+architecture below has been through repeated independent adversarial
 security/correctness/UX review; see [`REMAINING-WORK.md`](REMAINING-WORK.md)
 for a from-scratch audit of what's real vs. aspirational.
 
-| Area                        | Status                                                                                                                                                                                                                                                     |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| RSS/Atom sources            | **Live.** SSRF-hardened fetch (DNS pinning, private/link-local/reserved-range rejection, redirect re-validation, HTTPS-only), conditional resync, retention.                                                                                               |
-| Local summarization         | **Live.** Loopback-only Ollama integration with schema-validated structured output, exact model-digest attestation, and a deterministic no-model fallback.                                                                                                 |
-| Persistence                 | **Live.** Rust-owned SQLite, transactional version-gated migrations, WAL, foreign keys, generation-fenced deletion, privacy-epoch invalidation.                                                                                                            |
-| Credentials                 | **Live.** OS vault only (Windows Credential Manager / macOS Keychain / Linux Secret Service), fail-closed, no plaintext fallback.                                                                                                                          |
-| Scheduling                  | **Partial.** Runs only while the app window is open; no tray/background execution yet.                                                                                                                                                                     |
-| Ranking                     | **Live, bounded.** Explicit-feedback-only (More/Less), per-source, gated by a minimum-signal threshold, with a 25% chronological/diversity reserve and a per-item why-shown reason; pausable in Settings. No passive/behavioral signals exist or are read. |
-| Trends                      | **Live, bounded.** Deterministic lexical clustering runs as part of every digest: cross-source gate (a single source repeating itself is never a trend), same-source dedup collapse, deterministic fallback label. No model decides membership.            |
-| Mastodon / Bluesky / Reddit | **Not active.** Provider-neutral connector plumbing exists; live OAuth connectors are gated on policy/infrastructure review — tracked in `REMAINING-WORK.md`.                                                                                              |
+| Area                   | Status                                                                                                                                                                                                                                                     |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RSS/Atom sources       | **Live.** SSRF-hardened fetch (DNS pinning, private/link-local/reserved-range rejection, redirect re-validation, and HTTPS-downgrade rejection), conditional resync, retention.                                                                            |
+| X / Instagram archives | **Live in the current working tree.** Native streaming import of official X `tweets.js`/`tweet.js` and Instagram `posts_1.json` exports, bounded to 20 MiB and 25,000 entries. Files stay local; imports are replay-safe and manually repeatable.          |
+| Local summarization    | **Live.** Loopback-only Ollama integration with schema-validated structured output, exact model-digest attestation, and a deterministic no-model fallback.                                                                                                 |
+| Persistence            | **Live.** Rust-owned SQLite, transactional version-gated migrations, WAL, foreign keys, generation-fenced deletion, privacy-epoch invalidation.                                                                                                            |
+| Credentials            | **Live.** OS vault only (Windows Credential Manager / macOS Keychain / Linux Secret Service), fail-closed, no plaintext fallback.                                                                                                                          |
+| Scheduling             | **Partial.** Runs only while the app window is open; no tray/background execution yet.                                                                                                                                                                     |
+| Ranking                | **Live, bounded.** Explicit-feedback-only (More/Less), per-source, gated by a minimum-signal threshold, with a 25% chronological/diversity reserve and a per-item why-shown reason; pausable in Settings. No passive/behavioral signals exist or are read. |
+| Trends                 | **Live, bounded.** Deterministic lexical clustering runs as part of every digest: cross-source gate (a single source repeating itself is never a trend), same-source dedup collapse, deterministic fallback label. No model decides membership.            |
+| Original source links  | **Live in the current working tree.** An explicit evidence action asks Rust to open only credential-free HTTPS URLs of at most 2 KiB. The renderer has no general shell/opener permission.                                                                 |
+| Mastodon / Bluesky     | **Not active.** Provider-neutral contracts and disabled descriptors exist; live OAuth connectors remain behind provider/policy/native-flow evidence tracked in `REMAINING-WORK.md`.                                                                        |
+| Reddit                 | **Not implemented.** Access, cost, retention, and commercial-use terms require a fresh decision before engineering starts.                                                                                                                                 |
 
 ## Architecture
 
 ```
-  sources (RSS today; Mastodon/Bluesky/Reddit gated)
+  sources (RSS + local archive imports today; live social connectors gated)
         │
         ▼
   Rust core  ──  SQLite (WAL, migrations)
@@ -98,13 +99,14 @@ pnpm tauri dev       # the real desktop app, backed by Rust + SQLite
 ```
 
 The desktop app starts with a genuinely empty database in your OS's
-per-user app-data directory — no demo content, no fixtures. Add a source
-under **Sources** to get your first edition.
+per-user app-data directory — no demo content, no fixtures. Under **Sources**,
+add an RSS/Atom feed or import posts from an official X/Instagram data archive,
+then prepare your first edition.
 
 **Build a real installer**
 
 ```bash
-pnpm tauri build     # produces a signed-pending .msi / NSIS / .dmg / AppImage in src-tauri/target
+pnpm tauri build     # produces unsigned host-native bundle(s) under src-tauri/target/release/bundle
 ```
 
 ## Validation
@@ -132,7 +134,7 @@ Found a vulnerability? See [`SECURITY.md`](SECURITY.md) for private disclosure.
 src/                    presentation-only React app + validated typed transport
 src-tauri/src/          Rust commands, SQLite, connectors, local-model client, scheduler, vault
 src-tauri/migrations/   append-only transactional schema
-tests/fixtures/         inert deterministic connector fixtures
+tests/fixtures/         inert deterministic connector and archive fixtures
 docs/adr/               durable architecture decisions
 docs/security/          threat model
 docs/product/           guardrails and connector policy
@@ -141,9 +143,9 @@ docs/product/           guardrails and connector policy
 ## Roadmap
 
 [`REMAINING-WORK.md`](REMAINING-WORK.md) is a from-scratch, evidence-based
-audit of what's genuinely done vs. claimed, the real product gap, and a
-scoped design for optional git-based cross-device sync. It's the single
-source of truth for what's next — read it before opening an issue asking
+audit of what's genuinely done vs. claimed, the portal-parity decisions, the
+real product gap, and a scoped design for optional git-based cross-device
+sync. It's the single source of truth for what's next — read it before opening an issue asking
 "does this support X yet?"
 
 ## License
