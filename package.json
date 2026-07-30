@@ -26,8 +26,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "rust:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml --check",
-    "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "rust:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
+    "rust:test": "cargo test --locked --manifest-path src-tauri/Cargo.toml",
+    "rust:clippy": "cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
     "verify": "pnpm format && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm rust:fmt && pnpm rust:test && pnpm rust:clippy"
   },
   "dependencies": {
