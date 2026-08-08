@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
-import { transport } from './transport';
+import { isTauri, transport } from './transport';
 import {
   SettingsSchema,
   type ArchiveImportPlatform,
   type ArchiveImportResult,
   type Dashboard,
   type DigestItem,
+  type EditionDetail,
   type FeedbackSignal,
+  type LibraryItem,
+  type MastodonProbeResult,
+  type OpmlCandidate,
   type Settings,
   type SyncOutcome,
   type Source,
 } from './types';
 
-type View = 'today' | 'trends' | 'sources' | 'activity' | 'settings';
+type View = 'today' | 'trends' | 'library' | 'sources' | 'activity' | 'settings';
 type ThemeMode = 'auto' | 'light' | 'dark';
+type ZoomScale = 1 | 1.25 | 1.5 | 2;
 type PaletteCommand = {
   id: string;
   label: string;
@@ -21,16 +26,28 @@ type PaletteCommand = {
   view: View;
   targetId?: string;
 };
+type FeedReviewCandidate = OpmlCandidate & { reviewId: string };
+type FeedImportResult = FeedReviewCandidate & { added: boolean };
+type SourceDialog = { action: 'rename' | 'delete'; source: Source };
+
+const reviewCandidates = (candidates: OpmlCandidate[]): FeedReviewCandidate[] =>
+  candidates.map((candidate, index) => ({
+    ...candidate,
+    reviewId: `feed-${index}`,
+  }));
 
 const views: Array<{ id: View; label: string }> = [
   { id: 'today', label: 'Today' },
   { id: 'trends', label: 'Trends' },
+  { id: 'library', label: 'Library' },
   { id: 'sources', label: 'Sources' },
   { id: 'activity', label: 'Activity' },
   { id: 'settings', label: 'Privacy & settings' },
 ];
 
 const THEME_STORAGE_KEY = 'web.presentation.theme';
+const ZOOM_STORAGE_KEY = 'web.presentation.zoom';
+const ZOOM_SCALES: readonly ZoomScale[] = [1, 1.25, 1.5, 2];
 
 const formatDate = (value: string | null) => {
   if (value === null) return 'Not yet';
@@ -49,6 +66,8 @@ const requestId = () => crypto.randomUUID();
 const STATE_CHECK_MS = navigator.userAgent.includes('jsdom') ? 250 : 30_000;
 const isThemeMode = (value: string | null): value is ThemeMode =>
   value === 'auto' || value === 'light' || value === 'dark';
+const isZoomScale = (value: string | null): value is `${ZoomScale}` =>
+  value === '1' || value === '1.25' || value === '1.5' || value === '2';
 const initialThemeMode = (): ThemeMode => {
   try {
     const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -57,8 +76,52 @@ const initialThemeMode = (): ThemeMode => {
     return 'auto';
   }
 };
+const initialZoomScale = (): ZoomScale => {
+  try {
+    const saved = window.localStorage.getItem(ZOOM_STORAGE_KEY);
+    return isZoomScale(saved) ? (Number(saved) as ZoomScale) : 1;
+  } catch {
+    return 1;
+  }
+};
 const statusLabel = (value: string) => value.replaceAll('_', ' ');
 const MAX_OPENABLE_URL_BYTES = 2 * 1024;
+type PlatformFamily = 'apple' | 'windows' | 'linux' | 'other';
+
+// Client Hints are the browser's current-platform signal. Fall back only when they are not
+// available (for example, Firefox); a user-agent string may be spoofed and must not override it.
+const platformFamily = (): PlatformFamily => {
+  const navigatorWithClientHints = navigator as Navigator & {
+    userAgentData?: { platform?: string };
+  };
+  const signal =
+    navigatorWithClientHints.userAgentData?.platform || navigator.platform || navigator.userAgent;
+  if (/mac|iphone|ipad|ipod/i.test(signal)) return 'apple';
+  if (/windows|win32|win64/i.test(signal)) return 'windows';
+  if (/linux|x11/i.test(signal)) return 'linux';
+  return 'other';
+};
+
+const isApplePlatform = () => {
+  return platformFamily() === 'apple';
+};
+const commandShortcutLabel = () => (isApplePlatform() ? '⌘ K' : 'Ctrl K');
+const zoomShortcutLabel = () => (isApplePlatform() ? '⌘ + / −' : 'Ctrl + / −');
+const ollamaSetupHint = () => {
+  switch (platformFamily()) {
+    case 'apple':
+      return 'On macOS, install and start Ollama yourself, then choose one of its locally installed models here.';
+    case 'linux':
+      return 'On Linux, install and start Ollama through your approved local setup, then choose one of its locally installed models here.';
+    default:
+      return 'On Windows, install and start Ollama yourself, then choose one of its locally installed models here.';
+  }
+};
+const isCommandShortcut = (event: KeyboardEvent) =>
+  (isApplePlatform() ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) &&
+  !event.altKey &&
+  !event.shiftKey &&
+  event.key.toLowerCase() === 'k';
 const canOpenOriginal = (value: string | null): value is string => {
   if (!value || new TextEncoder().encode(value).byteLength > MAX_OPENABLE_URL_BYTES) return false;
   try {
@@ -119,6 +182,7 @@ function App() {
   const [pendingDashboard, setPendingDashboard] = useState<Dashboard>();
   const [syncReport, setSyncReport] = useState<SyncOutcome>();
   const [themeMode, setThemeMode] = useState<ThemeMode>(initialThemeMode);
+  const [zoomScale, setZoomScale] = useState<ZoomScale>(initialZoomScale);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
   const [activeCommandIndex, setActiveCommandIndex] = useState(0);
@@ -155,6 +219,20 @@ function App() {
     media.addEventListener('change', applyTheme);
     return () => media.removeEventListener('change', applyTheme);
   }, [themeMode]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ZOOM_STORAGE_KEY, String(zoomScale));
+    } catch {
+      // Reading-scale preferences are optional when storage is unavailable.
+    }
+    if (!isTauri()) return;
+    void import('@tauri-apps/api/webview')
+      .then(({ getCurrentWebview }) => getCurrentWebview().setZoom(zoomScale))
+      .catch(() => {
+        // The visual preference stays local even if a host cannot apply it yet.
+      });
+  }, [zoomScale]);
 
   const openCommandPalette = useCallback(() => {
     if (!dashboardRef.current) return;
@@ -258,8 +336,9 @@ function App() {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      if (isCommandShortcut(event)) {
         event.preventDefault();
+        if (event.repeat) return;
         if (paletteOpen) closeCommandPalette();
         else openCommandPalette();
         return;
@@ -351,6 +430,32 @@ function App() {
     }
   };
 
+  const probeMastodon = async (instanceUrl: string): Promise<MastodonProbeResult> => {
+    if (busy) throw new Error('Another local operation is still running.');
+    setBusy(true);
+    setOperationFailed(false);
+    setOperationErrorTarget(undefined);
+    setNotice('Checking Mastodon OAuth compatibility without connecting an account');
+    try {
+      const result = await transport.probeMastodonInstance(instanceUrl);
+      setNotice('Mastodon metadata is compatible. No account has been connected or stored.');
+      return result;
+    } catch (error) {
+      setOperationFailed(true);
+      setNotice(
+        safeErrorMessage(error, 'Mastodon compatibility could not be checked. No account changed.'),
+      );
+      throw error;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const connectMastodon = async (label: string, instanceUrl: string): Promise<boolean> =>
+    perform('Opening your browser for read-only Mastodon authorization', () =>
+      transport.connectMastodon(requestId(), label, instanceUrl),
+    );
+
   const closeUndo = () => {
     setUndoId(undefined);
     window.requestAnimationFrame(() => {
@@ -430,6 +535,10 @@ function App() {
     setView('sources');
     window.requestAnimationFrame(() => document.getElementById(controlId)?.focus());
   };
+  const openSourceCard = (sourceId: string) => {
+    setView('sources');
+    window.requestAnimationFrame(() => document.getElementById(`source-card-${sourceId}`)?.focus());
+  };
 
   const paletteCommands: PaletteCommand[] = [
     ...views.map(({ id, label }) => ({
@@ -497,8 +606,8 @@ function App() {
       'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
     );
     if (!focusable || focusable.length === 0) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
     if (event.shiftKey && document.activeElement === first) {
       event.preventDefault();
       last?.focus();
@@ -556,7 +665,7 @@ function App() {
         </nav>
         <button className="command-trigger" type="button" onClick={openCommandPalette}>
           <span>Search &amp; commands</span>
-          <kbd>Ctrl/⌘ K</kbd>
+          <kbd>{commandShortcutLabel()}</kbd>
         </button>
         <fieldset className="theme-control" role="radiogroup" aria-label="Theme">
           <legend>Appearance</legend>
@@ -640,11 +749,49 @@ function App() {
             onSync={() => void performSync()}
             onFeedback={sendFeedback}
             onOpenOriginal={(url) => void openOriginal(url)}
+            onSave={(itemId, saved) =>
+              perform(saved ? 'Saving for later' : 'Removing from saved', () =>
+                transport.setSaved(requestId(), itemId, saved),
+              )
+            }
             onAddSource={() => openSourcesControl('rss-label')}
             onImportArchive={() => openSourcesControl('archive-platform')}
           />
         )}
         {view === 'trends' && <Trends dashboard={dashboard} />}
+        {view === 'library' && (
+          <Library
+            dashboard={dashboard}
+            busy={busy}
+            onSave={(itemId, saved) =>
+              perform(saved ? 'Saving for later' : 'Removing from saved', () =>
+                transport.setSaved(requestId(), itemId, saved),
+              )
+            }
+            onOpenOriginal={(url) => void openOriginal(url)}
+            onViewSource={openSourceCard}
+            onExportSaved={async () => {
+              if (busy) return;
+              setBusy(true);
+              setOperationFailed(false);
+              setOperationErrorTarget(undefined);
+              setNotice('Choosing a saved-item export location');
+              try {
+                const exported = await transport.exportSavedItems();
+                setNotice(
+                  exported
+                    ? 'Saved items exported as a portable JSON file.'
+                    : 'Saved item export canceled. No local data changed.',
+                );
+              } catch (error) {
+                setOperationFailed(true);
+                setNotice(safeErrorMessage(error, 'Saved items could not be exported safely.'));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        )}
         {view === 'sources' && (
           <Sources
             dashboard={dashboard}
@@ -657,6 +804,25 @@ function App() {
               )
             }
             onImport={importArchive}
+            onRename={(sourceId, label) =>
+              perform(`Renaming ${label}`, () =>
+                transport.renameSource(requestId(), sourceId, label),
+              )
+            }
+            onSetPaused={(sourceId, paused) =>
+              perform(paused ? 'Pausing source' : 'Resuming source', () =>
+                transport.setSourcePaused(requestId(), sourceId, paused),
+              )
+            }
+            onSyncSource={(sourceId) =>
+              perform('Synchronizing this source', () =>
+                transport.syncSource(requestId(), sourceId),
+              )
+            }
+            onPickOpml={() => transport.pickOpml()}
+            onDiscover={(url) => transport.discoverFeeds(url)}
+            onProbeMastodon={probeMastodon}
+            onConnectMastodon={connectMastodon}
             statusMessage={notice}
             statusIsError={operationFailed && operationErrorTarget === 'rss-url'}
             onDelete={(source) =>
@@ -671,6 +837,8 @@ function App() {
           <SettingsView
             dashboard={dashboard}
             busy={busy}
+            zoomScale={zoomScale}
+            onZoomScaleChange={setZoomScale}
             onSave={(settings) =>
               perform('Saving private settings', () =>
                 transport.updateSettings(requestId(), settings),
@@ -685,6 +853,21 @@ function App() {
                   }
                   return reset;
                 },
+              )
+            }
+            onExport={() =>
+              perform('Choosing a local backup location', () =>
+                transport.exportBackup().then(() => dashboardRef.current ?? dashboard),
+              )
+            }
+            onExportOpml={() =>
+              perform('Choosing an OPML export location', () =>
+                transport.exportOpml().then(() => dashboardRef.current ?? dashboard),
+              )
+            }
+            onRestore={() =>
+              perform('Choosing and validating a local backup', () =>
+                transport.restoreBackup(requestId()),
               )
             }
           />
@@ -826,6 +1009,7 @@ function Today({
   onOpenOriginal,
   onAddSource,
   onImportArchive,
+  onSave,
 }: {
   dashboard: Dashboard;
   busy: boolean;
@@ -835,6 +1019,7 @@ function Today({
   onOpenOriginal: (url: string) => void;
   onAddSource: () => void;
   onImportArchive: () => void;
+  onSave: (itemId: string, saved: boolean) => Promise<boolean>;
 }) {
   if (dashboard.sources.length === 0) {
     return (
@@ -912,6 +1097,13 @@ function Today({
           <strong>{dashboard.items.length} useful items</strong>
         </div>
       </section>
+      <section className="since-last-edition" aria-labelledby="since-last-edition-title">
+        <div>
+          <p className="eyebrow">A deliberate cadence</p>
+          <h2 id="since-last-edition-title">Since your last edition</h2>
+        </div>
+        <p>{dashboard.sinceLastEdition.detail}</p>
+      </section>
       <section aria-labelledby="attention-heading">
         <div className="section-heading">
           <div>
@@ -929,6 +1121,7 @@ function Today({
               busy={busy}
               onFeedback={onFeedback}
               onOpenOriginal={onOpenOriginal}
+              onSave={onSave}
             />
           ))}
         </div>
@@ -953,12 +1146,14 @@ function DigestCard({
   busy,
   onFeedback,
   onOpenOriginal,
+  onSave,
 }: {
   item: DigestItem;
   featured: boolean;
   busy: boolean;
   onFeedback: (itemId: string, signal: FeedbackSignal) => void;
   onOpenOriginal: (url: string) => void;
+  onSave: (itemId: string, saved: boolean) => Promise<boolean>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const evidenceId = useId();
@@ -1036,6 +1231,9 @@ function DigestCard({
       )}
       <div className="feedback" aria-label={`Feedback for ${item.title}`}>
         <span>Was this useful?</span>
+        <button data-save-item={item.id} disabled={busy} onClick={() => void onSave(item.id, true)}>
+          Save for later
+        </button>
         <button
           data-feedback-item={item.id}
           data-feedback-signal="more_like_this"
@@ -1132,12 +1330,415 @@ function Trends({ dashboard }: { dashboard: Dashboard }) {
   );
 }
 
+function Library({
+  dashboard,
+  busy,
+  onSave,
+  onOpenOriginal,
+  onViewSource,
+  onExportSaved,
+}: {
+  dashboard: Dashboard;
+  busy: boolean;
+  onSave: (itemId: string, saved: boolean) => Promise<boolean>;
+  onOpenOriginal: (url: string) => void;
+  onViewSource: (sourceId: string) => void;
+  onExportSaved: () => Promise<void>;
+}) {
+  const [query, setQuery] = useState('');
+  const [items, setItems] = useState<LibraryItem[]>([]);
+  const [activeResultIndex, setActiveResultIndex] = useState(0);
+  const [selectedItem, setSelectedItem] = useState<LibraryItem>();
+  const [selectedEdition, setSelectedEdition] = useState<EditionDetail>();
+  const [mode, setMode] = useState<'search' | 'saved'>('saved');
+  const [status, setStatus] = useState(
+    'Your explicitly saved items stay local beyond ordinary retention.',
+  );
+  const detailDialogRef = useRef<HTMLDivElement>(null);
+  const detailCloseRef = useRef<HTMLButtonElement>(null);
+  const detailReturnFocusRef = useRef<HTMLElement | null>(null);
+  const runSearch = async (event: React.FormEvent) => {
+    event.preventDefault();
+    try {
+      setMode('search');
+      const result = await transport.searchLibrary(query);
+      setItems(result);
+      setActiveResultIndex(0);
+      setStatus(result.length ? `${result.length} local matches.` : 'No retained local matches.');
+    } catch (error) {
+      setStatus(safeErrorMessage(error, 'Local search could not run.'));
+    }
+  };
+  const loadSaved = async () => {
+    try {
+      setMode('saved');
+      const result = await transport.savedLibrary();
+      setItems(result);
+      setActiveResultIndex(0);
+      setStatus(result.length ? `${result.length} saved items.` : 'Nothing is saved yet.');
+    } catch (error) {
+      setStatus(safeErrorMessage(error, 'Saved items could not load.'));
+    }
+  };
+  const updateSaved = async (itemId: string, saved: boolean) => {
+    const updated = await onSave(itemId, saved);
+    if (!updated) return;
+    setItems((current) => {
+      return saved || mode !== 'saved'
+        ? current.map((item) => (item.id === itemId ? { ...item, saved } : item))
+        : current.filter((item) => item.id !== itemId);
+    });
+    setActiveResultIndex(0);
+    setSelectedItem((current) => (current?.id === itemId ? { ...current, saved } : current));
+    setStatus(saved ? 'Saved for later.' : 'Removed from saved items.');
+  };
+  const openEdition = async (editionId: string) => {
+    try {
+      setSelectedEdition(await transport.getEdition(editionId));
+      setStatus('Previous local edition opened.');
+    } catch (error) {
+      setStatus(safeErrorMessage(error, 'That edition is no longer available.'));
+    }
+  };
+  useEffect(() => {
+    let cancelled = false;
+    void transport
+      .savedLibrary()
+      .then((result) => {
+        if (cancelled) return;
+        setMode('saved');
+        setItems(result);
+        setActiveResultIndex(0);
+        setStatus(result.length ? `${result.length} saved items.` : 'Nothing is saved yet.');
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setStatus(safeErrorMessage(error, 'Saved items could not load.'));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const focusLibraryResult = (index: number) => {
+    if (!items.length) return;
+    const nextIndex = Math.min(Math.max(index, 0), items.length - 1);
+    setActiveResultIndex(nextIndex);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`library-result-${nextIndex}`)?.focus();
+    });
+  };
+  const openItemDetail = (item: LibraryItem) => {
+    detailReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSelectedItem(item);
+  };
+  const closeItemDetail = () => {
+    const returnTarget = detailReturnFocusRef.current;
+    detailReturnFocusRef.current = null;
+    setSelectedItem(undefined);
+    window.requestAnimationFrame(() => returnTarget?.focus());
+  };
+  const trapItemDetailFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeItemDetail();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = detailDialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled])',
+    );
+    if (!focusable?.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  useEffect(() => {
+    if (!selectedItem) return;
+    const frame = window.requestAnimationFrame(() => detailCloseRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedItem]);
+  return (
+    <>
+      <PageHeader
+        eyebrow="Private recall"
+        title="Library."
+        detail="Search only the material you deliberately retain, or keep a small explicit read-later shelf."
+      />
+      <form className="add-source library-search" onSubmit={(event) => void runSearch(event)}>
+        <label htmlFor="library-query">Search your local library</label>
+        <div className="library-search-row">
+          <input
+            id="library-query"
+            value={query}
+            maxLength={200}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowDown' && items.length) {
+                event.preventDefault();
+                focusLibraryResult(0);
+              }
+            }}
+            placeholder="People, ideas, places, or words you remember"
+          />
+          <button className="primary" disabled={busy || !query.trim()}>
+            Search
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={busy}
+            onClick={() => void loadSaved()}
+          >
+            Saved ({dashboard.library.savedCount})
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={busy || dashboard.library.savedCount === 0}
+            onClick={() => void onExportSaved()}
+          >
+            Export saved items
+          </button>
+        </div>
+        <p className="field-message" role="status">
+          {status}
+        </p>
+        {items.length > 0 && (
+          <p id="library-keyboard-help" className="field-message compact">
+            From the search field, press Down Arrow to enter results. Use Up/Down, Home, or End to
+            move between result cards.
+          </p>
+        )}
+      </form>
+      <section
+        className="library-list"
+        aria-label={mode === 'saved' ? 'Saved items' : 'Search results'}
+        aria-describedby={items.length > 0 ? 'library-keyboard-help' : undefined}
+      >
+        {items.map((item, index) => (
+          <article
+            id={`library-result-${index}`}
+            className="library-card"
+            key={item.id}
+            tabIndex={index === activeResultIndex ? 0 : -1}
+            aria-label={`${mode === 'saved' ? 'Saved item' : 'Search result'} ${index + 1} of ${items.length}: ${item.title}`}
+            onKeyDown={(event) => {
+              if (event.target !== event.currentTarget) return;
+              if (event.key === 'ArrowDown') {
+                event.preventDefault();
+                focusLibraryResult(index + 1);
+              } else if (event.key === 'ArrowUp') {
+                event.preventDefault();
+                focusLibraryResult(index - 1);
+              } else if (event.key === 'Home') {
+                event.preventDefault();
+                focusLibraryResult(0);
+              } else if (event.key === 'End') {
+                event.preventDefault();
+                focusLibraryResult(items.length - 1);
+              }
+            }}
+          >
+            <p className="source-line">
+              {item.author} · {item.source} · {formatDate(item.publishedAt)}
+            </p>
+            <h2>{item.title}</h2>
+            <p>{item.excerpt}</p>
+            <div className="library-actions">
+              <button
+                className="text-button"
+                aria-label={`Read details for ${item.title}`}
+                onClick={() => openItemDetail(item)}
+              >
+                Read details
+              </button>
+              <button
+                className="text-button"
+                disabled={busy}
+                onClick={() => void updateSaved(item.id, !item.saved)}
+              >
+                {item.saved ? 'Remove from saved' : 'Save for later'}
+              </button>
+              {canOpenOriginal(item.canonicalUrl) && (
+                <button
+                  className="text-button"
+                  disabled={busy}
+                  onClick={() => {
+                    const url = item.canonicalUrl;
+                    if (canOpenOriginal(url)) onOpenOriginal(url);
+                  }}
+                >
+                  Open original
+                </button>
+              )}
+            </div>
+          </article>
+        ))}
+        {items.length === 0 && (
+          <p className="empty-state">
+            {mode === 'saved'
+              ? 'Save a useful item from an edition to return to it later.'
+              : 'Search remains local and is limited to retained sources.'}
+          </p>
+        )}
+      </section>
+      {selectedItem && (
+        <div
+          className="command-backdrop item-detail-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeItemDetail();
+          }}
+        >
+          <div
+            ref={detailDialogRef}
+            className="command-dialog item-detail-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="library-item-detail-title"
+            onKeyDown={trapItemDetailFocus}
+          >
+            <div className="command-dialog-header">
+              <div>
+                <p className="eyebrow">Retained local item</p>
+                <h2 id="library-item-detail-title">{selectedItem.title}</h2>
+              </div>
+              <button
+                ref={detailCloseRef}
+                className="secondary command-close"
+                type="button"
+                onClick={closeItemDetail}
+              >
+                Close details
+              </button>
+            </div>
+            <div className="item-detail-body">
+              <p className="source-line">
+                {selectedItem.author} · {selectedItem.source} ·{' '}
+                {formatDate(selectedItem.publishedAt)}
+              </p>
+              <p>{selectedItem.excerpt}</p>
+              <p className="hint">
+                <strong>Source health:</strong> {statusLabel(selectedItem.sourceStatus)}
+                {selectedItem.sourceHealthDetail ? ` — ${selectedItem.sourceHealthDetail}` : ''}
+              </p>
+              <p className="hint">
+                <strong>Summary:</strong>{' '}
+                {selectedItem.summaryMethod
+                  ? `${statusLabel(selectedItem.summaryMethod)} via ${selectedItem.summaryProvider ?? 'local processing'}${selectedItem.summaryUncertainty ? ` — ${selectedItem.summaryUncertainty}` : ''}`
+                  : 'No generated summary is retained for this item.'}
+              </p>
+              <p className="hint">
+                This is the retained local excerpt. Open the attributed original only when you
+                choose.
+              </p>
+              <div className="library-actions">
+                <button className="secondary" onClick={() => onViewSource(selectedItem.sourceId)}>
+                  View source
+                </button>
+                <button
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => void updateSaved(selectedItem.id, !selectedItem.saved)}
+                >
+                  {selectedItem.saved ? 'Remove from saved' : 'Save for later'}
+                </button>
+                {canOpenOriginal(selectedItem.canonicalUrl) && (
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() => {
+                      const url = selectedItem.canonicalUrl;
+                      if (canOpenOriginal(url)) onOpenOriginal(url);
+                    }}
+                  >
+                    Open original
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      <section className="edition-history" aria-labelledby="edition-history-title">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Finite history</p>
+            <h2 id="edition-history-title">Previous editions</h2>
+          </div>
+          <p>Latest {dashboard.history.length}</p>
+        </div>
+        {dashboard.history.map((edition) => (
+          <article className="history-row" key={edition.id}>
+            <div>
+              <strong>{edition.label}</strong>
+              <p>{edition.summary}</p>
+            </div>
+            <div className="history-actions">
+              <span>
+                {edition.itemCount} items · {formatDate(edition.generatedAt)}
+              </span>
+              <button
+                className="text-button"
+                disabled={busy}
+                onClick={() => void openEdition(edition.id)}
+              >
+                Read edition
+              </button>
+            </div>
+          </article>
+        ))}
+      </section>
+      {selectedEdition && (
+        <section className="past-edition" aria-labelledby="past-edition-title">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">From your local history</p>
+              <h2 id="past-edition-title">{selectedEdition.edition.label}</h2>
+            </div>
+            <button className="text-button" onClick={() => setSelectedEdition(undefined)}>
+              Close
+            </button>
+          </div>
+          <p className="hint">
+            {formatDate(selectedEdition.edition.generatedAt)} · {selectedEdition.edition.summary}
+          </p>
+          <div className="library-list">
+            {selectedEdition.items.map((item) => (
+              <article className="library-card" key={item.id}>
+                <p className="source-line">
+                  {item.author} · {item.source}
+                </p>
+                <h3>{item.title}</h3>
+                <p>{item.summary}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
 function Sources({
   dashboard,
   busy,
   onAdd,
   onImport,
   onDelete,
+  onRename,
+  onSetPaused,
+  onPickOpml,
+  onDiscover,
+  onProbeMastodon,
+  onConnectMastodon,
+  onSyncSource,
   statusMessage,
   statusIsError,
 }: {
@@ -1145,7 +1746,14 @@ function Sources({
   busy: boolean;
   onAdd: (label: string, url: string) => Promise<boolean>;
   onImport: (platform: ArchiveImportPlatform, label: string) => Promise<boolean>;
-  onDelete: (source: Source) => void;
+  onDelete: (source: Source) => Promise<boolean>;
+  onRename: (sourceId: string, label: string) => Promise<boolean>;
+  onSetPaused: (sourceId: string, paused: boolean) => Promise<boolean>;
+  onPickOpml: () => Promise<OpmlCandidate[]>;
+  onDiscover: (url: string) => Promise<OpmlCandidate[]>;
+  onProbeMastodon: (instanceUrl: string) => Promise<MastodonProbeResult>;
+  onConnectMastodon: (label: string, instanceUrl: string) => Promise<boolean>;
+  onSyncSource: (sourceId: string) => Promise<boolean>;
   statusMessage: string;
   statusIsError: boolean;
 }) {
@@ -1153,6 +1761,92 @@ function Sources({
   const [url, setUrl] = useState('');
   const [importPlatform, setImportPlatform] = useState<ArchiveImportPlatform>('x');
   const [importLabel, setImportLabel] = useState('My X archive');
+  const [opmlCandidates, setOpmlCandidates] = useState<FeedReviewCandidate[]>([]);
+  const [feedImportResults, setFeedImportResults] = useState<FeedImportResult[]>([]);
+  const [opmlNotice, setOpmlNotice] = useState('');
+  const [mastodonInstanceUrl, setMastodonInstanceUrl] = useState('');
+  const [mastodonProbe, setMastodonProbe] = useState<MastodonProbeResult>();
+  const [mastodonNotice, setMastodonNotice] = useState('');
+  const [mastodonLabel, setMastodonLabel] = useState('My Mastodon');
+  const [sourceDialog, setSourceDialog] = useState<SourceDialog>();
+  const [sourceLabelDraft, setSourceLabelDraft] = useState('');
+  const sourceDialogRef = useRef<HTMLDivElement>(null);
+  const sourceDialogInputRef = useRef<HTMLInputElement>(null);
+  const sourceDialogReturnFocusRef = useRef<HTMLElement | null>(null);
+  const openSourceDialog = (action: SourceDialog['action'], source: Source) => {
+    sourceDialogReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSourceLabelDraft(source.label);
+    setSourceDialog({ action, source });
+  };
+  const closeSourceDialog = (restoreFocus = true) => {
+    setSourceDialog(undefined);
+    const returnTarget = sourceDialogReturnFocusRef.current;
+    sourceDialogReturnFocusRef.current = null;
+    if (restoreFocus) window.requestAnimationFrame(() => returnTarget?.focus());
+  };
+  const trapSourceDialogFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Tab') return;
+    const focusable = sourceDialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), [href]',
+    );
+    if (!focusable?.length) return;
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  useEffect(() => {
+    if (!sourceDialog) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (sourceDialog.action === 'rename') sourceDialogInputRef.current?.focus();
+      else sourceDialogRef.current?.querySelector<HTMLElement>('button:not([disabled])')?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [sourceDialog]);
+  useEffect(() => {
+    if (!sourceDialog) return;
+    const dismissWithEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) {
+        event.preventDefault();
+        closeSourceDialog();
+      }
+    };
+    document.addEventListener('keydown', dismissWithEscape);
+    return () => document.removeEventListener('keydown', dismissWithEscape);
+  }, [busy, sourceDialog]);
+  const updateReviewedCandidate = (
+    reviewId: string,
+    field: keyof Pick<FeedReviewCandidate, 'label' | 'url'>,
+    value: string,
+  ) => {
+    setOpmlCandidates((current) =>
+      current.map((candidate) =>
+        candidate.reviewId === reviewId ? { ...candidate, [field]: value } : candidate,
+      ),
+    );
+  };
+  const retryReviewedCandidate = async (candidate: FeedReviewCandidate) => {
+    const added = await onAdd(candidate.label, candidate.url);
+    setFeedImportResults((current) =>
+      current.map((result) =>
+        result.reviewId === candidate.reviewId ? { ...candidate, added } : result,
+      ),
+    );
+    if (added) {
+      setOpmlCandidates((current) => current.filter((row) => row.reviewId !== candidate.reviewId));
+      setOpmlNotice(`Added ${candidate.label}.`);
+    } else {
+      setOpmlNotice(
+        `Could not add ${candidate.label}. Edit it or try again when the feed is ready.`,
+      );
+    }
+  };
   return (
     <>
       <PageHeader
@@ -1203,9 +1897,32 @@ function Sources({
         <button className="primary" disabled={busy}>
           Add read-only feed
         </button>
+        <button
+          type="button"
+          className="secondary"
+          disabled={busy || !url}
+          onClick={() =>
+            void onDiscover(url)
+              .then((candidates) => {
+                setOpmlCandidates(reviewCandidates(candidates));
+                setFeedImportResults([]);
+                setOpmlNotice(
+                  candidates.length
+                    ? `${candidates.length} advertised feeds are ready for review.`
+                    : 'No advertised feeds were found.',
+                );
+              })
+              .catch((error) =>
+                setOpmlNotice(safeErrorMessage(error, 'That website could not be safely checked.')),
+              )
+          }
+        >
+          Find feeds on this website
+        </button>
         <p>
-          Web fetches at most 2 MB and 100 items, blocks private-network targets, follows no more
-          than three validated redirects, and stores excerpts with attribution.
+          Paste either a feed address or a publication website. Web checks at most 512 KB for
+          advertised feeds (and at most 2 MB per connected feed), blocks private-network targets,
+          follows no more than three validated redirects, and stores excerpts with attribution.
         </p>
         <p
           id="rss-operation-status"
@@ -1272,6 +1989,155 @@ function Sources({
           </p>
         </form>
       </section>
+      <section className="opml-import-section" aria-labelledby="opml-import-title">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Move in gently</p>
+            <h2 id="opml-import-title">Bring an OPML feed list</h2>
+          </div>
+          <p>Review before adding</p>
+        </div>
+        <p className="hint">
+          Choose a local OPML file. Web reads at most 1 MiB and shows public RSS/Atom URLs before it
+          connects anything.
+        </p>
+        <button
+          className="secondary"
+          disabled={busy}
+          onClick={() =>
+            void onPickOpml()
+              .then((candidates) => {
+                setOpmlCandidates(reviewCandidates(candidates));
+                setFeedImportResults([]);
+                setOpmlNotice(
+                  candidates.length
+                    ? `${candidates.length} feeds are ready for review.`
+                    : 'No OPML file was selected.',
+                );
+              })
+              .catch((error) =>
+                setOpmlNotice(safeErrorMessage(error, 'The OPML list could not be read.')),
+              )
+          }
+        >
+          Choose OPML file
+        </button>
+        {opmlNotice && (
+          <p className="field-message" role="status">
+            {opmlNotice}
+          </p>
+        )}
+        {opmlCandidates.length > 0 && (
+          <div className="opml-review">
+            <p>
+              <strong>
+                {feedImportResults.some((result) => !result.added)
+                  ? 'Only feeds that did not connect remain below. Edit or retry them individually.'
+                  : 'Nothing is connected until you choose Add reviewed feeds.'}
+              </strong>
+            </p>
+            {feedImportResults.some((result) => !result.added) ? (
+              <div className="failed-feed-review">
+                {opmlCandidates.map((candidate) => (
+                  <fieldset className="failed-feed-row" key={candidate.reviewId}>
+                    <legend>Feed that needs attention</legend>
+                    <label htmlFor={`review-label-${candidate.reviewId}`}>Feed name</label>
+                    <input
+                      id={`review-label-${candidate.reviewId}`}
+                      maxLength={100}
+                      value={candidate.label}
+                      onChange={(event) =>
+                        updateReviewedCandidate(candidate.reviewId, 'label', event.target.value)
+                      }
+                    />
+                    <label htmlFor={`review-url-${candidate.reviewId}`}>RSS or Atom URL</label>
+                    <input
+                      id={`review-url-${candidate.reviewId}`}
+                      type="url"
+                      value={candidate.url}
+                      onChange={(event) =>
+                        updateReviewedCandidate(candidate.reviewId, 'url', event.target.value)
+                      }
+                    />
+                    <div className="source-actions">
+                      <button
+                        className="secondary"
+                        disabled={busy || !candidate.label.trim() || !candidate.url.trim()}
+                        onClick={() => void retryReviewedCandidate(candidate)}
+                      >
+                        Retry {candidate.label}
+                      </button>
+                      <button
+                        className="text-button"
+                        disabled={busy}
+                        onClick={() => {
+                          setOpmlCandidates((current) =>
+                            current.filter((row) => row.reviewId !== candidate.reviewId),
+                          );
+                          setFeedImportResults((current) =>
+                            current.filter((result) => result.reviewId !== candidate.reviewId),
+                          );
+                        }}
+                      >
+                        Remove from review
+                      </button>
+                    </div>
+                  </fieldset>
+                ))}
+              </div>
+            ) : (
+              <>
+                <ul>
+                  {opmlCandidates.slice(0, 12).map((candidate) => (
+                    <li key={candidate.reviewId}>
+                      {candidate.label} <small>{candidate.url}</small>
+                    </li>
+                  ))}
+                  {opmlCandidates.length > 12 && <li>…and {opmlCandidates.length - 12} more.</li>}
+                </ul>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() =>
+                    void (async () => {
+                      const results: FeedImportResult[] = [];
+                      for (const candidate of opmlCandidates) {
+                        results.push({
+                          ...candidate,
+                          added: await onAdd(candidate.label, candidate.url),
+                        });
+                      }
+                      setFeedImportResults(results);
+                      const added = results.filter((result) => result.added).length;
+                      const failed = results.filter((result) => !result.added);
+                      setOpmlCandidates(failed);
+                      setOpmlNotice(
+                        failed.length
+                          ? `Added ${added} of ${results.length} reviewed feeds. Edit or retry only the ${failed.length} feed${failed.length === 1 ? '' : 's'} that did not connect.`
+                          : `Added ${added} reviewed feeds.`,
+                      );
+                    })()
+                  }
+                >
+                  Add reviewed feeds
+                </button>
+              </>
+            )}
+            <button className="text-button" disabled={busy} onClick={() => setOpmlCandidates([])}>
+              Discard review
+            </button>
+          </div>
+        )}
+        {feedImportResults.length > 0 && (
+          <ul className="feed-import-results" aria-label="Feed import results">
+            {feedImportResults.map((result) => (
+              <li key={result.reviewId} className={result.added ? 'success' : 'failure'}>
+                {result.label}: {result.added ? 'added' : 'not added'}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
       <section aria-labelledby="official-connectors-title">
         <h2 id="official-connectors-title">Official social connectors</h2>
         <p className="hint">
@@ -1297,6 +2163,102 @@ function Sources({
                   <p>{connector.detail}</p>
                   {connector.unmetPrerequisite && (
                     <p className="field-message">Required first: {connector.unmetPrerequisite}</p>
+                  )}
+                  {connector.kind === 'mastodon' && (
+                    <form
+                      className="mastodon-compatibility"
+                      aria-describedby="mastodon-compatibility-help"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void onProbeMastodon(mastodonInstanceUrl)
+                          .then((result) => {
+                            setMastodonProbe(result);
+                            setMastodonNotice(
+                              `Compatible read scopes: ${result.supportedScopes.join(', ')}. You can now authorize read-only access.`,
+                            );
+                          })
+                          .catch((error) =>
+                            setMastodonNotice(
+                              safeErrorMessage(
+                                error,
+                                'This instance could not be checked. No account was connected.',
+                              ),
+                            ),
+                          );
+                      }}
+                    >
+                      <label htmlFor="mastodon-instance-url">Mastodon instance</label>
+                      <input
+                        id="mastodon-instance-url"
+                        required
+                        type="url"
+                        inputMode="url"
+                        autoComplete="url"
+                        maxLength={2048}
+                        value={mastodonInstanceUrl}
+                        onChange={(event) => {
+                          setMastodonInstanceUrl(event.target.value);
+                          setMastodonProbe(undefined);
+                        }}
+                        placeholder="https://social.example/"
+                      />
+                      <button className="secondary" disabled={busy || !isTauri()}>
+                        Check compatibility
+                      </button>
+                      {mastodonProbe && (
+                        <>
+                          <label htmlFor="mastodon-label">Source name</label>
+                          <input
+                            id="mastodon-label"
+                            maxLength={100}
+                            value={mastodonLabel}
+                            onChange={(event) => setMastodonLabel(event.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="primary"
+                            disabled={busy || !mastodonLabel.trim() || !isTauri()}
+                            onClick={() =>
+                              void onConnectMastodon(mastodonLabel, mastodonInstanceUrl).then(
+                                (connected) => {
+                                  if (connected)
+                                    setMastodonNotice(
+                                      'Authorization completed. Your read-only source is ready to synchronize.',
+                                    );
+                                },
+                              )
+                            }
+                          >
+                            Authorize read-only Mastodon
+                          </button>
+                        </>
+                      )}
+                      <p id="mastodon-compatibility-help" className="hint">
+                        Check compatibility first. Authorize opens your system browser only after a
+                        compatible result; Web requests read scopes only and stores its token in the
+                        OS vault.
+                      </p>
+                      {!isTauri() && (
+                        <p className="field-message">
+                          Compatibility checks need the native desktop app; browser preview makes no
+                          provider request.
+                        </p>
+                      )}
+                      {mastodonProbe && (
+                        <p className="field-message">
+                          {mastodonProbe.instanceUrl} is compatible. It is not connected.
+                        </p>
+                      )}
+                      {mastodonNotice && (
+                        <p
+                          id="mastodon-compatibility-status"
+                          className="field-message"
+                          role="status"
+                        >
+                          {mastodonNotice}
+                        </p>
+                      )}
+                    </form>
                   )}
                   <p className="hint">
                     Read-only; no posting, likes, direct messages, search, or contact discovery.
@@ -1367,19 +2329,37 @@ function Sources({
                 </div>
               </dl>
             </div>
+            <div className="source-actions">
+              <button
+                className="text-button"
+                disabled={busy}
+                onClick={() => openSourceDialog('rename', source)}
+              >
+                Rename
+              </button>
+              {source.kind === 'rss' && (
+                <button
+                  className="text-button"
+                  disabled={busy}
+                  onClick={() => void onSetPaused(source.id, source.status !== 'paused')}
+                >
+                  {source.status === 'paused' ? 'Resume' : 'Pause'}
+                </button>
+              )}
+              {source.kind === 'rss' && source.status !== 'paused' && (
+                <button
+                  className="text-button"
+                  disabled={busy}
+                  onClick={() => void onSyncSource(source.id)}
+                >
+                  Sync now
+                </button>
+              )}
+            </div>
             <button
               className="danger-text"
               disabled={busy}
-              onClick={() => {
-                if (
-                  window.confirm(
-                    source.kind === 'archive_import'
-                      ? `Delete ${source.label} and all locally imported posts, summaries, and feedback? This cannot be undone.`
-                      : `Delete ${source.label} and all of its local posts, summaries, feedback, and credentials? This cannot be undone.`,
-                  )
-                )
-                  onDelete(source);
-              }}
+              onClick={() => openSourceDialog('delete', source)}
             >
               {source.kind === 'archive_import'
                 ? 'Delete import & local data'
@@ -1399,6 +2379,124 @@ function Sources({
           automation, bypass access controls, import session cookies, or claim unsupported coverage.
         </p>
       </div>
+      {sourceDialog && (
+        <div
+          className="command-backdrop source-dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !busy) closeSourceDialog();
+          }}
+        >
+          <div
+            ref={sourceDialogRef}
+            className="command-dialog source-action-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="source-action-title"
+            aria-describedby="source-action-description"
+            onKeyDown={trapSourceDialogFocus}
+          >
+            <div className="command-dialog-header">
+              <div>
+                <p className="eyebrow">
+                  {sourceDialog.action === 'rename' ? 'Source details' : 'Local data'}
+                </p>
+                <h2 id="source-action-title">
+                  {sourceDialog.action === 'rename'
+                    ? `Rename ${sourceDialog.source.label}`
+                    : `Delete ${sourceDialog.source.label}?`}
+                </h2>
+              </div>
+              <button
+                className="secondary command-close"
+                type="button"
+                disabled={busy}
+                onClick={() => closeSourceDialog()}
+              >
+                Close
+              </button>
+            </div>
+            {sourceDialog.action === 'rename' ? (
+              <form
+                className="source-action-body"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const nextLabel = sourceLabelDraft.trim();
+                  if (!nextLabel || nextLabel === sourceDialog.source.label) {
+                    closeSourceDialog();
+                    return;
+                  }
+                  void onRename(sourceDialog.source.id, nextLabel).then((renamed) => {
+                    if (renamed) closeSourceDialog();
+                  });
+                }}
+              >
+                <p id="source-action-description">
+                  This changes the private label shown on this device. The feed address stays the
+                  same.
+                </p>
+                <label htmlFor="source-label-draft">Source name</label>
+                <input
+                  ref={sourceDialogInputRef}
+                  id="source-label-draft"
+                  required
+                  maxLength={100}
+                  value={sourceLabelDraft}
+                  onChange={(event) => setSourceLabelDraft(event.target.value)}
+                />
+                <div className="source-dialog-actions">
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() => closeSourceDialog()}
+                  >
+                    Cancel
+                  </button>
+                  <button className="primary" disabled={busy || !sourceLabelDraft.trim()}>
+                    Save name
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="source-action-body">
+                <p id="source-action-description">
+                  {sourceDialog.source.kind === 'archive_import'
+                    ? 'This permanently removes this import and its locally stored posts, summaries, and feedback from this device.'
+                    : 'This disconnects the source and permanently removes its local posts, summaries, feedback, and credentials from this device.'}
+                </p>
+                <p className="source-delete-warning">
+                  This cannot be undone. Export a local backup first if you may want this data
+                  later.
+                </p>
+                <div className="source-dialog-actions">
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() => closeSourceDialog()}
+                  >
+                    Keep source
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    disabled={busy}
+                    onClick={() =>
+                      void onDelete(sourceDialog.source).then((deleted) => {
+                        if (deleted) closeSourceDialog(false);
+                      })
+                    }
+                  >
+                    {sourceDialog.source.kind === 'archive_import'
+                      ? 'Delete import and local data'
+                      : 'Disconnect and delete'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -1600,19 +2698,34 @@ function Activity({ dashboard }: { dashboard: Dashboard }) {
 function SettingsView({
   dashboard,
   busy,
+  zoomScale,
+  onZoomScaleChange,
   onSave,
   onReset,
+  onExport,
+  onExportOpml,
+  onRestore,
 }: {
   dashboard: Dashboard;
   busy: boolean;
+  zoomScale: ZoomScale;
+  onZoomScaleChange: (zoom: ZoomScale) => void;
   onSave: (settings: Settings) => Promise<boolean>;
   onReset: () => Promise<boolean>;
+  onExport: () => Promise<boolean>;
+  onExportOpml: () => Promise<boolean>;
+  onRestore: () => Promise<boolean>;
 }) {
   const [settings, setSettings] = useState(dashboard.settings);
   const [scheduleHour, setScheduleHour] = useState(String(dashboard.settings.scheduleHour));
   const [quietStart, setQuietStart] = useState(String(dashboard.settings.quietHoursStart));
   const [quietEnd, setQuietEnd] = useState(String(dashboard.settings.quietHoursEnd));
   const [retentionDays, setRetentionDays] = useState(String(dashboard.settings.retentionDays));
+  const [installedModels, setInstalledModels] = useState<string[]>([]);
+  const [restoreDialogOpen, setRestoreDialogOpen] = useState(false);
+  const restoreDialogRef = useRef<HTMLDivElement>(null);
+  const restoreConfirmRef = useRef<HTMLButtonElement>(null);
+  const restoreReturnFocusRef = useRef<HTMLElement | null>(null);
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setSettings((current) => ({ ...current, [key]: value }));
   const scheduleNumber = /^\d{1,2}$/.test(scheduleHour) ? Number(scheduleHour) : Number.NaN;
@@ -1644,6 +2757,50 @@ function SettingsView({
   };
   const settingsValid =
     SettingsSchema.safeParse(candidate).success && !scheduleConflict && modelValid;
+  const openRestoreDialog = () => {
+    restoreReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setRestoreDialogOpen(true);
+  };
+  const closeRestoreDialog = (restoreFocus = true) => {
+    setRestoreDialogOpen(false);
+    const returnTarget = restoreReturnFocusRef.current;
+    restoreReturnFocusRef.current = null;
+    if (restoreFocus) window.requestAnimationFrame(() => returnTarget?.focus());
+  };
+  const trapRestoreDialogFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Tab') return;
+    const focusable = restoreDialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+    );
+    if (!focusable?.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  useEffect(() => {
+    if (!restoreDialogOpen) return;
+    const frame = window.requestAnimationFrame(() => restoreConfirmRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [restoreDialogOpen]);
+  useEffect(() => {
+    if (!restoreDialogOpen) return;
+    const dismissWithEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) {
+        event.preventDefault();
+        closeRestoreDialog();
+      }
+    };
+    document.addEventListener('keydown', dismissWithEscape);
+    return () => document.removeEventListener('keydown', dismissWithEscape);
+  }, [busy, restoreDialogOpen]);
   return (
     <>
       <PageHeader
@@ -1652,6 +2809,81 @@ function SettingsView({
         detail="See what runs, what leaves the computer, and how long local copies remain."
       />
       <section className="settings-grid">
+        <article className="settings-panel">
+          <h2>Reading scale</h2>
+          <p>
+            Make the whole app easier to read without changing the source material. This preference
+            stays on this device.
+          </p>
+          <fieldset className="reading-scale-control" aria-describedby="reading-scale-help">
+            <legend>Page scale</legend>
+            {ZOOM_SCALES.map((scale) => (
+              <label key={scale}>
+                <input
+                  type="radio"
+                  name="reading-scale"
+                  value={scale}
+                  checked={zoomScale === scale}
+                  onChange={() => onZoomScaleChange(scale)}
+                />
+                <span>{Math.round(scale * 100)}%</span>
+              </label>
+            ))}
+          </fieldset>
+          <p id="reading-scale-help" className="hint">
+            You can also use {zoomShortcutLabel()} to change page zoom with your current platform.
+          </p>
+        </article>
+        <article className="settings-panel">
+          <h2>Backup &amp; recovery</h2>
+          <p>
+            Export creates a consistent local SQLite snapshot. Restore validates and migrates a copy
+            before replacing this device’s data; the prior state is retained as a local rollback
+            snapshot if replacement fails.
+          </p>
+          <div className="library-actions">
+            <button className="secondary" disabled={busy} onClick={() => void onExportOpml()}>
+              Export RSS as OPML
+            </button>
+            <button className="secondary" disabled={busy} onClick={() => void onExport()}>
+              Export local backup
+            </button>
+            <button className="secondary" disabled={busy} onClick={openRestoreDialog}>
+              Restore backup
+            </button>
+          </div>
+        </article>
+        <article className="settings-panel">
+          <h2>Finite editions</h2>
+          <label htmlFor="edition-size">Items per edition</label>
+          <input
+            id="edition-size"
+            type="range"
+            min="10"
+            max="40"
+            value={settings.editionSize}
+            onChange={(event) => update('editionSize', Number(event.target.value))}
+          />
+          <p className="hint">
+            <strong>{settings.editionSize} items maximum.</strong> Web first reserves room across
+            sources, then fills the remaining finite space with your explicit preferences and a
+            chronological reserve.
+          </p>
+          <label className="toggle-row">
+            <span>
+              <strong>Close to tray</strong>
+              <small>
+                Closing the window keeps the local scheduler available until you choose Quit from
+                the tray.
+              </small>
+            </span>
+            <input
+              type="checkbox"
+              checked={settings.closeToTray}
+              onChange={(event) => update('closeToTray', event.target.checked)}
+            />
+          </label>
+        </article>
         <article className="settings-panel">
           <h2>Edition schedule</h2>
           <label className="toggle-row">
@@ -1818,6 +3050,7 @@ function SettingsView({
             Explicit installed Ollama model
             <input
               id="selected-model"
+              list="installed-models"
               type="text"
               maxLength={200}
               value={settings.selectedModel}
@@ -1826,6 +3059,19 @@ function SettingsView({
               placeholder="Blank uses deterministic fallback"
               onChange={(event) => update('selectedModel', event.target.value)}
             />
+            <datalist id="installed-models">
+              {installedModels.map((model) => (
+                <option value={model} key={model} />
+              ))}
+            </datalist>
+            <button
+              type="button"
+              className="text-button"
+              disabled={busy}
+              onClick={() => void transport.installedModels().then(setInstalledModels)}
+            >
+              Refresh installed models
+            </button>
           </label>
           <span
             id="selected-model-help"
@@ -1835,6 +3081,7 @@ function SettingsView({
               ? 'Use the exact installed name; letters, numbers, dot, underscore, colon, slash, and hyphen only.'
               : 'Remove spaces and @; use only letters, numbers, dot, underscore, colon, slash, and hyphen.'}
           </span>
+          <p className="hint">{ollamaSetupHint()}</p>
           <p>{dashboard.model.detail}</p>
           {dashboard.model.model && (
             <dl className="host-capabilities">
@@ -1957,6 +3204,73 @@ function SettingsView({
           {busy ? 'Saving…' : 'Save settings'}
         </button>
       </div>
+      {restoreDialogOpen && (
+        <div
+          className="command-backdrop source-dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !busy) closeRestoreDialog();
+          }}
+        >
+          <div
+            ref={restoreDialogRef}
+            className="command-dialog source-action-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="restore-backup-title"
+            aria-describedby="restore-backup-description"
+            onKeyDown={trapRestoreDialogFocus}
+          >
+            <div className="command-dialog-header">
+              <div>
+                <p className="eyebrow">Local data</p>
+                <h2 id="restore-backup-title">Restore a local backup?</h2>
+              </div>
+              <button
+                className="secondary command-close"
+                type="button"
+                disabled={busy}
+                onClick={() => closeRestoreDialog()}
+              >
+                Close
+              </button>
+            </div>
+            <div className="source-action-body">
+              <p id="restore-backup-description">
+                Web will let you choose a backup, validate and migrate a copy, then replace this
+                device&rsquo;s local data. If replacement or reopening fails, it retains a rollback
+                snapshot of the prior state.
+              </p>
+              <p className="source-delete-warning">
+                This replaces the current device data. Export a backup first if you may need the
+                current state later.
+              </p>
+              <div className="source-dialog-actions">
+                <button
+                  className="secondary"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => closeRestoreDialog()}
+                >
+                  Keep current data
+                </button>
+                <button
+                  ref={restoreConfirmRef}
+                  className="danger-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() =>
+                    void onRestore().then((restored) => {
+                      if (restored) closeRestoreDialog(false);
+                    })
+                  }
+                >
+                  Choose backup and restore
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

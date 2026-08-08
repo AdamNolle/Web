@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a reproducible problem in a supported local workflow.
+title: 'bug: '
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private feed URLs, archive contents, database files, or security vulnerabilities. Report security issues privately through SECURITY.md.
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What happened?
+      description: Include the expected and actual outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: "1. ...\n2. ..."
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host platform
+      options: [Windows, macOS, Linux, Browser demo, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Version and logs
+      description: Include the app version/commit and redacted error text only.

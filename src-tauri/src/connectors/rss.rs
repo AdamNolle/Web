@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use super::{
 };
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DISCOVERY_BYTES: usize = 512 * 1024;
 const MAX_REDIRECTS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -27,33 +29,11 @@ impl RssConnector {
         Ok(Self)
     }
 
-    async fn pinned_client(url: &Url) -> Result<Client, ConnectorError> {
-        validate_public_feed_url(url.as_str())?;
-        let mut builder = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("WebSocialDigest/0.1 (+local read-only feed client)");
-        if let Some(Host::Domain(host)) = url.host() {
-            let port = url
-                .port_or_known_default()
-                .ok_or(ConnectorError::UnsafeUrl)?;
-            let addresses = lookup_host((host, port))
-                .await
-                .map_err(|_| ConnectorError::UnsafeUrl)?
-                .collect::<Vec<_>>();
-            validate_resolved_addresses(&addresses)?;
-            builder = builder.resolve_to_addrs(host, &addresses);
-        }
-        builder.build().map_err(|_| ConnectorError::Transient)
-    }
-
     async fn fetch(&self, request: &SyncRequest) -> Result<SyncPage, ConnectorError> {
         validate_sync_request(request)?;
         let mut current = Url::parse(&request.url).map_err(|_| ConnectorError::UnsafeUrl)?;
         for redirect_count in 0..=MAX_REDIRECTS {
-            let client = Self::pinned_client(&current).await?;
+            let client = pinned_public_client(&current).await?;
             let mut builder = client.get(current.clone());
             if redirect_count == 0 {
                 if let Some(etag) = &request.etag {
@@ -141,6 +121,163 @@ impl RssConnector {
         }
         Err(ConnectorError::UnsafeUrl)
     }
+
+    /// Fetches a normal publication URL through the same pinned, redirect-revalidated
+    /// transport as feed synchronization, then returns only advertised RSS/Atom links.
+    /// This deliberately does not guess from page text or ask the renderer to fetch.
+    pub async fn discover_feeds(
+        &self,
+        value: &str,
+    ) -> Result<Vec<(String, String)>, ConnectorError> {
+        if value.len() > 2_048 {
+            return Err(ConnectorError::UnsafeUrl);
+        }
+        let mut current = Url::parse(value).map_err(|_| ConnectorError::UnsafeUrl)?;
+        validate_public_feed_url(current.as_str())?;
+        for redirect_count in 0..=MAX_REDIRECTS {
+            let client = pinned_public_client(&current).await?;
+            let response = client
+                .get(current.clone())
+                .send()
+                .await
+                .map_err(|_| ConnectorError::Transient)?;
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                return Err(ConnectorError::RateLimited);
+            }
+            if response.status().is_redirection() {
+                if redirect_count == MAX_REDIRECTS {
+                    return Err(ConnectorError::UnsafeUrl);
+                }
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|header| header.to_str().ok())
+                    .ok_or(ConnectorError::UnsafeUrl)?;
+                let next = current
+                    .join(location)
+                    .map_err(|_| ConnectorError::UnsafeUrl)?;
+                if !redirect_allowed(&current, &next) {
+                    return Err(ConnectorError::UnsafeUrl);
+                }
+                current = next;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(ConnectorError::Transient);
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_DISCOVERY_BYTES as u64)
+            {
+                return Err(ConnectorError::ResponseTooLarge);
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|header| header.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if content_type.contains("application/rss+xml")
+                || content_type.contains("application/atom+xml")
+                || content_type.contains("application/xml")
+            {
+                return Ok(vec![(
+                    current.host_str().unwrap_or("Feed").to_owned(),
+                    current.to_string(),
+                )]);
+            }
+            let mut bytes = Vec::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| ConnectorError::Transient)?;
+                if bytes.len().saturating_add(chunk.len()) > MAX_DISCOVERY_BYTES {
+                    return Err(ConnectorError::ResponseTooLarge);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return advertised_feeds(&current, &bytes);
+        }
+        Err(ConnectorError::UnsafeUrl)
+    }
+}
+
+/// Creates a proxy-free, DNS-pinned client for a URL that has passed the shared public-network
+/// policy. Callers remain responsible for their own scheme and response policy; this transport
+/// never follows redirects so every redirect target must be validated and pinned separately.
+pub(crate) async fn pinned_public_client(url: &Url) -> Result<Client, ConnectorError> {
+    validate_public_feed_url(url.as_str())?;
+    let mut builder = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(Duration::from_secs(5))
+        .user_agent("WebSocialDigest/0.1 (+local read-only connector client)");
+    if let Some(Host::Domain(host)) = url.host() {
+        let port = url
+            .port_or_known_default()
+            .ok_or(ConnectorError::UnsafeUrl)?;
+        let addresses = lookup_host((host, port))
+            .await
+            .map_err(|_| ConnectorError::UnsafeUrl)?
+            .collect::<Vec<_>>();
+        validate_resolved_addresses(&addresses)?;
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder.build().map_err(|_| ConnectorError::Transient)
+}
+
+fn html_attribute(tag: &str, attribute: &str) -> Option<String> {
+    for quote in ['\"', '\''] {
+        let needle = format!("{attribute}={quote}");
+        let lower = tag.to_ascii_lowercase();
+        let Some(start) = lower.find(&needle.to_ascii_lowercase()) else {
+            continue;
+        };
+        let tail = &tag[start + needle.len()..];
+        if let Some(end) = tail.find(quote) {
+            return Some(tail[..end].replace("&amp;", "&"));
+        }
+    }
+    None
+}
+
+fn advertised_feeds(base: &Url, bytes: &[u8]) -> Result<Vec<(String, String)>, ConnectorError> {
+    let html = std::str::from_utf8(bytes).map_err(|_| ConnectorError::InvalidFeed)?;
+    let mut found = Vec::new();
+    let mut seen = BTreeSet::new();
+    for fragment in html.split('<') {
+        let tag = fragment.split('>').next().unwrap_or_default();
+        if !tag.trim_start().to_ascii_lowercase().starts_with("link") {
+            continue;
+        }
+        let rel = html_attribute(tag, "rel")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let kind = html_attribute(tag, "type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !rel
+            .split_ascii_whitespace()
+            .any(|token| token == "alternate")
+            || !(kind.contains("rss+xml") || kind.contains("atom+xml"))
+        {
+            continue;
+        }
+        let Some(href) = html_attribute(tag, "href") else {
+            continue;
+        };
+        let feed = base.join(&href).map_err(|_| ConnectorError::InvalidFeed)?;
+        if validate_public_feed_url(feed.as_str()).is_err() || !seen.insert(feed.to_string()) {
+            continue;
+        }
+        let label = html_attribute(tag, "title")
+            .unwrap_or_else(|| feed.host_str().unwrap_or("Feed").to_owned());
+        found.push((label.chars().take(100).collect(), feed.to_string()));
+    }
+    if found.is_empty() {
+        return Err(ConnectorError::InvalidFeed);
+    }
+    Ok(found)
 }
 
 #[async_trait]
@@ -652,5 +789,35 @@ mod tests {
             clean_text("<script>alert(1)</script><p>Hello\u{202e} world</p>", 100),
             "alert(1)Hello world"
         );
+    }
+
+    #[test]
+    fn discovery_returns_only_explicit_safe_rss_or_atom_alternates() {
+        let base = Url::parse("https://news.example.org/briefing/").expect("base");
+        let html = br#"<html><head>
+          <link rel="alternate" type="application/rss+xml" title="Morning feed" href="/rss.xml">
+          <link rel="alternate stylesheet" type="application/atom+xml" href="atom.xml">
+          <link rel="alternate" type="text/html" href="/about">
+          <link rel="alternate" type="application/rss+xml" href="http://127.0.0.1/private.xml">
+        </head></html>"#;
+        assert_eq!(
+            advertised_feeds(&base, html).expect("advertised feeds"),
+            vec![
+                (
+                    "Morning feed".to_owned(),
+                    "https://news.example.org/rss.xml".to_owned()
+                ),
+                (
+                    "news.example.org".to_owned(),
+                    "https://news.example.org/briefing/atom.xml".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_pages_without_explicit_feed_advertisements() {
+        let base = Url::parse("https://news.example.org/").expect("base");
+        assert!(advertised_feeds(&base, b"<a href='/rss.xml'>RSS</a>").is_err());
     }
 }

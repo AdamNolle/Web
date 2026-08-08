@@ -93,6 +93,27 @@ impl OllamaProvider {
         &self.model
     }
 
+    /// Lists only exact names reported by the fixed loopback runtime. This is a
+    /// picker aid, never an installer or a guessed compatibility claim.
+    pub async fn installed_models(endpoint: &str) -> Result<Vec<String>, ModelError> {
+        let probe = Self::with_timeout(endpoint, "web-picker-probe", Duration::from_secs(3))?;
+        let body = probe.get_limited("api/tags").await?;
+        let value = serde_json::from_slice::<serde_json::Value>(&body)
+            .map_err(|_| ModelError::InvalidResponse)?;
+        let mut names = value
+            .get("models")
+            .and_then(|models| models.as_array())
+            .ok_or(ModelError::InvalidResponse)?
+            .iter()
+            .filter_map(|model| model.get("name").and_then(|name| name.as_str()))
+            .filter(|name| name.len() <= 200 && validate_model_name(name).is_ok())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     async fn get_limited(&self, path: &str) -> Result<Vec<u8>, ModelError> {
         let response = self
             .client

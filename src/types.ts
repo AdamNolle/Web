@@ -75,6 +75,8 @@ export const SettingsSchema = z.object({
     .max(200)
     .regex(/^$|^[A-Za-z0-9._:/-]+$/),
   rankingPaused: z.boolean(),
+  editionSize: z.number().int().min(10).max(40),
+  closeToTray: z.boolean(),
 });
 
 export const ModelStateSchema = z.enum([
@@ -170,6 +172,23 @@ export const DashboardSchema = z.object({
   model: ModelStatusSchema,
   host: HostCapabilitiesSchema,
   connectors: z.array(ConnectorDescriptorSchema).length(3),
+  history: z
+    .array(
+      z.object({
+        id: z.string(),
+        label: z.string(),
+        generatedAt: z.string(),
+        summary: z.string(),
+        itemCount: z.number().int().nonnegative(),
+      }),
+    )
+    .max(12),
+  library: z.object({ savedCount: z.number().int().nonnegative() }),
+  sinceLastEdition: z.object({
+    newItems: z.number().int().nonnegative(),
+    newSources: z.number().int().nonnegative(),
+    detail: z.string(),
+  }),
   runner: z.object({
     active: z.boolean(),
     inFlight: z.boolean(),
@@ -190,6 +209,46 @@ export const ArchiveImportResultSchema = z.object({
   dashboard: DashboardSchema,
 });
 
+export const LibraryItemSchema = z.object({
+  id: z.string(),
+  sourceId: z.string(),
+  source: z.string(),
+  author: z.string(),
+  title: z.string(),
+  excerpt: z.string(),
+  publishedAt: z.string(),
+  canonicalUrl: z.string().url().nullable(),
+  saved: z.boolean(),
+  sourceStatus: z.string(),
+  sourceHealthDetail: z.string(),
+  summaryMethod: z.string().nullable(),
+  summaryProvider: z.string().nullable(),
+  summaryUncertainty: z.string().nullable(),
+});
+
+export const EditionDetailSchema = z.object({
+  edition: z.object({
+    id: z.string(),
+    label: z.string(),
+    generatedAt: z.string(),
+    nextEditionAt: z.string().nullable(),
+    summary: z.string(),
+  }),
+  items: z.array(DigestItemSchema).max(40),
+  trends: z.array(TrendSchema).max(5),
+});
+
+export const OpmlCandidateSchema = z.object({
+  label: z.string().min(1).max(100),
+  url: z.string().url(),
+});
+
+export const MastodonProbeResultSchema = z.object({
+  instanceUrl: z.string().url(),
+  supportedScopes: z.array(z.string().min(1).max(100)).max(100),
+  connectionEnabled: z.literal(false),
+});
+
 export type Source = z.infer<typeof SourceSchema>;
 export type DigestItem = z.infer<typeof DigestItemSchema>;
 export type Trend = z.infer<typeof TrendSchema>;
@@ -201,6 +260,10 @@ export type SyncOutcome = z.infer<typeof SyncOutcomeSchema>;
 export type SyncSourcesResult = { dashboard: Dashboard; outcome: SyncOutcome };
 export type ArchiveImportPlatform = z.infer<typeof ArchiveImportPlatformSchema>;
 export type ArchiveImportResult = z.infer<typeof ArchiveImportResultSchema>;
+export type LibraryItem = z.infer<typeof LibraryItemSchema>;
+export type OpmlCandidate = z.infer<typeof OpmlCandidateSchema>;
+export type MastodonProbeResult = z.infer<typeof MastodonProbeResultSchema>;
+export type EditionDetail = z.infer<typeof EditionDetailSchema>;
 export type FeedbackSignal = 'more_like_this' | 'less_like_this' | 'not_relevant' | 'mute_source';
 
 export interface AppError {

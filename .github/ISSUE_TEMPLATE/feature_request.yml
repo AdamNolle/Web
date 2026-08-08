@@ -1,0 +1,23 @@
+name: Product proposal
+description: Propose a calm, local-first capability.
+title: 'proposal: '
+labels: [proposal]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Web deliberately excludes engagement loops, scraping, cookie import, and unsupported social connectors. Check REMAINING-WORK.md before proposing provider work.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What calm, finite workflow would this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Privacy and platform boundary
+      description: Describe local data, network access, provider policy, and cross-platform implications.
+    validations:
+      required: true

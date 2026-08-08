@@ -237,6 +237,8 @@ export const demoDashboard: Dashboard = {
     feedbackCount: 0,
     selectedModel: '',
     rankingPaused: false,
+    editionSize: 12,
+    closeToTray: false,
   },
   model: {
     provider: 'Ollama-compatible',
@@ -320,5 +322,20 @@ export const demoDashboard: Dashboard = {
     nextScheduledAt: null,
     lastOutcome: 'idle',
     detail: 'Browser preview has no resident Rust runner.',
+  },
+  history: [
+    {
+      id: 'edition-demo',
+      label: 'Today',
+      generatedAt: '2026-07-26T08:00:00Z',
+      summary: 'A calm, finite local edition prepared from your selected sources.',
+      itemCount: 4,
+    },
+  ],
+  library: { savedCount: 0 },
+  sinceLastEdition: {
+    newItems: 0,
+    newSources: 0,
+    detail: 'This is your first retained edition.',
   },
 };

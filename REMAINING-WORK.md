@@ -1,6 +1,6 @@
 # Web: current state and remaining work
 
-_Last reconciled against the repository and `../web-portal` on 2026-07-28._
+_Last reconciled against the repository and `../web-portal` on 2026-08-08._
 
 This is the canonical product backlog. Older iteration notes in `progress.md`, `.ralph/`, and
 `.artifacts/` are useful historical evidence, but they are not an accurate list of what remains.
@@ -12,11 +12,10 @@ deterministic-summary paths are real, explicit-feedback ranking and lexical tren
 process-resident scheduler is active, Windows installers have been produced, and the app has been
 launched against a real per-user database.
 
-The largest remaining gap is product breadth, not foundation quality. A user can build a calm RSS
-digest and, in the current working tree, import official X and Instagram archives. A user still
-cannot migrate an existing feed library, search or save collected material, browse prior editions,
-leave the window while background work continues, restore a backup, or connect a live social
-account.
+The largest remaining gaps are native acceptance, release hardening, and live social accounts. A
+user can build a calm RSS digest, migrate reviewed OPML feeds, search and save collected material,
+browse prior editions, use close-to-tray, and restore a local backup in the current working tree.
+Those workflows still need packaged/native evidence; no live social account is connected.
 
 The right direction from `web-portal` is to adapt its best interaction patterns to Web's calmer
 finite-edition product. Copying its entire operations cockpit, engagement machinery, or local admin
@@ -53,7 +52,9 @@ surface would work against Web's product and security boundaries.
 - Intentional zero-source first-run route with clear RSS/archive choices and focus routed to the
   relevant Sources control; the generic caught-up edition remains reserved for connected sources.
 - In the current working tree, adapted from the useful parts of `web-portal`:
-  - accessible Ctrl/Cmd+K command palette for views, sources, and trends;
+  - accessible platform-aware command palette: ⌘K on Apple platforms and Ctrl+K on Windows/Linux;
+    its Ctrl+K/Escape behavior has release-WebView smoke evidence on Windows, while macOS and Linux
+    native proof remains open;
   - explicit Auto/Light/Dark presentation modes;
   - Activity-scoped vitals, runner/model state, source-health table, and chronological activity;
   - responsive glass/purple visual system without copying the portal's global live ticker or dense
@@ -110,21 +111,31 @@ Do not reintroduce these as open tasks:
    - Add a repeatable native-dialog end-to-end test or retain equivalent dated manual evidence.
 
 2. **Close the round-12 social-foundation acceptance gaps.**
-   - Add delete-then-reassign, retention-then-reassign, partial/complete, rollback, reopen, and
-     migration-12 tests for the durable comment identity ledger.
-   - Add the duplicate-A/missing-B prepared-set regression and assert no cursor, comment, summary,
-     job, or privacy side effect.
-   - Add reversed-complete-batch coverage proving stable model input and stable identity after
-     reopen.
-   - Review whether plaintext `remote_id` and `post_remote_id` in the durable ledger are acceptable
-     under the retention promise. Prefer keyed, source-scoped fingerprints if raw provider
-     identifiers are not required for diagnostics.
+   - Completed locally: v15 migrates the durable comment ledger from raw provider identifiers to
+     source-scoped SHA-256 fingerprints. The ledger still survives retention to prevent identity
+     reassignment, but no longer stores raw comment/post provider IDs; source deletion cascades it.
+   - Regression coverage now proves delete-then-reassign, retention-then-reassign, partial/complete,
+     transactional rollback for duplicate-A/missing-B prepared sets (cursor/comments/summaries/jobs/
+     privacy unchanged), migration, and reversed complete snapshots after reopen.
+   - This is an opaque source-scoped fingerprint, not a vault-backed HMAC. Revisit the privacy
+     tradeoff only if a future provider requires cross-device durable identity matching.
 
 3. **Refresh visual evidence.**
    - Replace `docs/media/screenshot-today.jpg`; it predates the purple/glass redesign, command
      palette, theme control, and Activity work.
-   - Run keyboard, narrow-window, 200% zoom, reduced-motion, light, dark, empty, loading, partial,
-     and failure-state visual checks in an actual WebView.
+   - On 2026-08-08, the repeatable Windows release-WebView smoke captured and inspected the
+     first-run screen at default/light desktop width, dark desktop width, and a compact 800×720
+     window. The compact navigation reflows and the dark theme retains the intended hierarchy.
+     The screenshot output stays under ignored build tooling rather than being mistaken for a
+     published product image.
+   - `zoomHotkeysEnabled` is enabled for the primary window, with the narrowly scoped
+     `core:webview:allow-set-webview-zoom` capability required by Tauri's macOS/Linux polyfill.
+     On 2026-08-08, Windows release-WebView smoke selected the explicit Reading scale control at
+     200%, confirmed its selected and persisted values, and captured an inspected enlarged native
+     frame. Synthetic Ctrl+Plus still does not expose a measurable WebView2 zoom factor.
+   - Still run reduced-motion, loaded, partial, and failure-state visual checks in an actual
+     WebView; repeat all visual acceptance, including reading scale, on macOS and Linux before
+     release.
    - Confirm a packaged build opens an eligible HTTPS original in the default browser while HTTP,
      credentialed, oversized, and missing URLs remain non-operable.
    - Browser capture was unavailable during this audit, and the checked-in `web-portal/web-app` is
@@ -132,6 +143,9 @@ Do not reintroduce these as open tasks:
 
 4. **Activate and prove CI.**
    - Track/push `.github/workflows/ci.yml`.
+   - The latest upstream matrix (2026-07-30) passed Windows and Ubuntu but failed macOS on an
+     archive-import test timing race. The assertion now waits for the rendered Activity row; a new
+     hosted matrix run is still required.
    - Obtain green Windows, macOS, and Ubuntu runs using the declared Node 24/Rust 1.96 toolchain.
    - Keep the host-native `pnpm tauri build --no-bundle` leg and retain Rust caching/timeouts.
    - Add a packaged smoke lane later; compilation alone does not attest WebView, vault, or migration
@@ -139,75 +153,91 @@ Do not reintroduce these as open tasks:
 
 ### P1 — make Web useful every day
 
-1. **Feed discovery and OPML.**
-   - Accept OPML through a Rust-owned native picker and show per-feed success/failure.
-   - Resolve a normal website URL to advertised RSS/Atom feeds through the hardened Rust network
-     boundary; do not fetch from React.
-   - Support bulk review before adding dozens of feeds.
+1. **Finish the feed-library experience.**
+   - Rust-owned OPML picking, per-feed outcomes, bulk review, bounded website-to-explicit-feed
+     discovery, and accessible per-row failed-feed edit/retry are implemented. Add packaged native
+     acceptance evidence for the file dialog and connection outcomes.
 
-2. **Configurable, fair editions and history.**
-   - Make edition size configurable within a calm finite range such as 10–40.
-   - Guarantee one eligible item per source before a source receives a second slot.
-   - Expose previous editions from existing digest rows, with clear generated-at and source-change
-     context.
-   - Add a concise “since your last edition” summary instead of a perpetual live ticker.
+2. **Finish edition history.**
+   - Configurable 10–40 item editions, first-pass source fairness, a bounded previous-edition
+     list, selectable prior editions, and the concise “since your last edition” summary are
+     implemented without a live ticker. Add native visual and assistive-technology evidence.
 
-3. **Search/Recall.**
-   - Add SQLite FTS5 over retained title/body/author/source text, with migration and rebuild tests.
-   - Make a Library surface for Recall results and later Saved items.
-   - Keep search local, bounded, keyboard accessible, and explicit about retention limits.
+3. **Refine Search/Recall.**
+   - SQLite FTS5, local bounded Library search, retained-text disclosure, and roving keyboard
+     navigation are implemented. Add a real-WebView assistive-technology pass.
 
-4. **Saved/read-later.**
-   - Add an explicit saved state, not a passive engagement signal.
-   - Define whether saved items survive ordinary retention; if they do, make that exception visible
-     and exportable.
-   - Add Saved under Library rather than another global dashboard tab.
+4. **Refine Saved/read-later.**
+   - Explicit Saved lives under Library, survives ordinary retention, and is covered by SQLite
+     backup/restore. A native, versioned JSON export now carries the saved content, attribution,
+     publication time, safe canonical URL, and retained-summary provenance without database IDs or
+     transient source-health details. Add packaged native-dialog evidence for the export path.
 
-5. **Installed-model picker and model setup.**
-   - Surface the already queried Ollama model inventory as a picker instead of a free-text-only
-     field.
-   - Explain runtime unavailable, model missing, incompatible, unverified, and degraded states with
-     direct remediation.
-   - Keep downloads user-initiated; never silently install a runtime or model.
+5. **Refine model setup.**
+   - Installed-model inventory can populate the native picker and all runtime states remain visible.
+     Platform-specific Windows/macOS/Linux setup copy now directs users to install/start Ollama
+     themselves; Web never downloads a runtime or model.
 
 6. **Source lifecycle controls.**
-   - Add pause/resume, rename, and a bounded “sync/retry this source” action without requiring
-     destructive disconnect/re-add.
-   - Keep archive sources manual-only and route their equivalent action to re-import.
-   - Preserve source generations, retry eligibility, request receipts, and truthful per-source
-     health through every transition.
+   - Rename, pause/resume, and bounded per-source sync are implemented for RSS; archive sources are
+     manual re-import only. Rename and destructive deletion now use focus-trapped, Escape-dismissable
+     in-app dialogs rather than browser-owned prompts. Add native lifecycle acceptance evidence for
+     each transition.
 
 7. **Backup/export/restore.**
-   - Export OPML, settings, feedback/saved state, and a versioned JSON or SQLite backup through
-     Rust-owned native dialogs.
-   - Use SQLite's online backup API or a consistent snapshot; never copy a live WAL database
-     naively.
-   - Validate restore into a temporary database, migrate it, then replace atomically with a
-     recoverable rollback path.
+   - Native SQLite snapshot export/restore validates and migrates a temporary candidate before
+     replacement inside an isolated restore workspace, retaining and reopening a rollback snapshot
+     on a file-replacement or reopen failure. Export stages an existing backup rather than deleting
+     it before publishing a new snapshot. Automated interruption seams cover malformed/future-
+     schema candidates, failed export/rename/reopen, stale-artifact cleanup, and successful
+     replacement. RSS-only OPML export is implemented through a native save dialog; it round-trips
+     escaped titles and public feed URLs without representing archives as subscriptions. Add
+     packaged restore/interruption and native-dialog evidence.
 
 8. **Tray/background lifecycle.**
-   - Add an explicit tray icon, close-to-hide preference, and true Quit action.
-   - Keep the existing Rust scheduler/lease machinery; change only process lifecycle.
-   - Verify Windows sleep/resume, duplicate-instance, battery, and clean-exit behavior before
-     enabling scheduling by default.
+   - Explicit tray Show/Quit actions and a close-to-hide preference are implemented. A packaged
+     Windows smoke on 2026-08-08 confirmed that a second launch exits while the first instance stays
+     alive and is brought forward. Verify Windows sleep/resume, battery, and clean-exit behavior
+     before enabling scheduling by default.
    - Treat OS-level wake services as a separate later feature, not part of the first tray slice.
 
 9. **Item detail and source navigation.**
-   - Evolve the current inline evidence expansion into an accessible detail drawer when the added
-     context justifies it.
-   - Show provenance, summary method/uncertainty, source health, and related items without hiding
-     the canonical evidence.
-   - Preserve focus return, Escape handling, narrow-window reflow, and reduced motion.
+   - Library items open in an accessible local-detail dialog with focus trapping, Escape/focus
+     return, explicit original opening, and source navigation. Bounded Library DTOs now also show
+     current source health plus summary method/provider/uncertainty without loading new content.
+   - Add narrow-window and real-WebView assistive-technology acceptance evidence.
 
 ### P2 — live social sources
 
 1. **Mastodon first.**
-   - Dynamically register a read-only client per instance.
-   - Use PKCE, native browser authorization, bounded callback/session state, and the existing OS
-     vault.
-   - Ingest the home timeline and bounded status context with exact complete/partial provenance.
-   - Sanitize provider HTML, enforce source generation/cursor fencing, and add multi-instance
-     contract tests.
+   - Completed locally: the current official authorization-server metadata contract is parsed
+     fail-closed and can be checked only from an explicit native interaction through the existing
+     proxy-free public-address DNS/IP-pinned transport. It reads the fixed same-origin discovery
+     endpoint, refuses redirects, caps the response at 64 KiB, and stores nothing. A future
+     instance must be root HTTPS and advertise same-origin authorization,
+     token, and application-registration endpoints; authorization-code; PKCE `S256`; and broad
+     `read` or both `read:accounts` plus `read:statuses`. The preflight performs no registration,
+     browser launch, token exchange, or secret persistence.
+   - Completed locally: a native desktop orchestration composes preflight,
+     dynamic registration, PKCE, a bounded numeric-loopback callback, token exchange, and an
+     OS-vault handoff. A person must first run the native compatibility check, then explicitly
+     choose the read-only authorization action; it opens the system browser, never renderer
+     networking. Before a vault write it persists only an opaque cleanup reference;
+     indeterminate vault outcomes seal the request and are deleted on a later launch. Source and
+     successful receipt commit atomically, and a newly authorized source remains paused until
+     timeline ingestion is implemented. Focused tests cover successful handoff, unknown vault
+     finality, and the real local callback.
+   - Add provider-acceptance evidence plus source-deletion/locked-vault crash tests on Windows,
+     macOS, and Linux before exposing the orchestration.
+   - Completed locally: the privileged read-only home-timeline adapter accepts only a Rust-held
+     vault token, uses the pinned public-network transport, caps each response at 1 MiB and 40
+     statuses, normalizes provider HTML to inert text, and goes through the existing
+     generation/cursor-fenced batch persistence and summary preparation path. Boosts and content
+     warnings have parser coverage. A source remains paused pending explicit activation evidence.
+   - Completed locally: context is fetched only for five root statuses, capped at 256 KiB each,
+     and retained as partial evidence with an exact root scope. Unfetched/failed roots are never
+     presented as complete; a zero-context batch reports discussion unavailable.
+   - Add multi-instance contract tests and provider-acceptance evidence.
    - Revalidate instance policy, scopes, attribution, retention, deletion, and rate limits at
      implementation time.
 
@@ -229,13 +259,26 @@ Do not reintroduce these as open tasks:
    - Packaged launch, migration, WebView hostile-content, vault round trip, offline mode, CPU-only
      model fallback, sleep/resume, update, and uninstall checks on Windows.
    - Equivalent native package/runtime/keyring evidence on supported macOS and Ubuntu targets.
-   - Decide and document architectures explicitly rather than implying universal support.
+   - Architectures are explicitly recorded in
+     [`docs/release/support-matrix.md`](docs/release/support-matrix.md); its current Windows x64
+     local evidence must not be generalized to macOS or Linux.
 
 2. **Supply chain and update path.**
    - Lockfile-enforced builds, dependency/license/secret scans, SBOM, checksums, and provenance.
+     The working-tree CI runs `pnpm audit --audit-level=high` and `cargo audit` after locked
+     installation. A tested cross-platform `pnpm artifacts:checksums` generator now produces a
+     sorted SHA-256 manifest for exact release-candidate artifact paths; release publication and
+     provenance remain open.
+   - On 2026-08-08, updating Vite/Vitest/ESLint/TypeScript-ESLint reduced npm audit to one low
+     advisory. Cargo audit's current remaining report is the Linux-only, Tauri-transitive
+     `RUSTSEC-2024-0429` GLib unsoundness plus GTK3 maintenance warnings. It has no confirmed
+     remote-to-app path under Web's local-app threat model, but it must be reassessed with the next
+     Tauri GTK/WebKit stack update and before Linux release proof.
    - Tauri updater endpoints, signed manifests, rollback behavior, and migration compatibility.
-   - Resolve the current Windows bundler warning that `__TAURI_BUNDLE_TYPE` was not found while
-     patching the binary; align/verify Tauri CLI and Rust crate behavior before updater work.
+   - The Windows `__TAURI_BUNDLE_TYPE` bundler warning was resolved locally on 2026-08-08 by
+     aligning `@tauri-apps/cli` 2.11.4 and `@tauri-apps/api` 2.11.1 with the Rust Tauri 2.11 line;
+     fresh MSI and NSIS builds both patched bundle-type information without a warning. Updater
+     endpoints and signed manifests still need their own implementation and release evidence.
    - Reproducible release notes that distinguish compile evidence from packaged runtime evidence.
 
 3. **Platform trust.**
@@ -245,9 +288,9 @@ Do not reintroduce these as open tasks:
    - Clean-host install/update/uninstall evidence before calling any platform “released.”
 
 4. **Repository publication and maintenance.**
-   - Add `CONTRIBUTING.md` with the exact `pnpm verify` and native build expectations.
-   - Add focused issue/PR templates and a dependency-update policy; enable Dependabot or Renovate
-     only with lockfile-preserving grouped updates and CI.
+   - `CONTRIBUTING.md`, focused issue/PR templates, and a monthly grouped Dependabot policy are
+     present in the working tree. They become active only after the repository changes are reviewed
+     and pushed.
    - Add frontend integration/native E2E coverage before using a coverage percentage as a gate.
    - Decide whether a contributor code of conduct and support policy are appropriate before public
      issue intake.
@@ -261,8 +304,8 @@ Do not reintroduce these as open tasks:
 | Global six-metric strip        | Scope useful metrics to Activity                                              | Implemented as Activity vitals                                                        |
 | Run timeline and source health | Adapt with truthful bounded states and table semantics                        | Source health and chronological activity baseline implemented; timeline remains later |
 | Detail drawer                  | Adapt for item evidence, provenance, source, and related items                | P1                                                                                    |
-| Recall/Saved/Notebook grouping | Use a Library surface; Recall and Saved first                                 | P1                                                                                    |
-| “Since last visit” ticker      | Convert to a finite since-last-edition summary                                | P1                                                                                    |
+| Recall/Saved/Notebook grouping | Use a Library surface; Recall and Saved first                                 | Implemented in current working tree; keyboard/native assistive review remains         |
+| “Since last visit” ticker      | Convert to a finite since-last-edition summary                                | Implemented as bounded since-last-edition copy, never a ticker                        |
 | Git peer sync                  | Redesign around Rust HTTPS Git, vault secrets, conflict rules, and tombstones | Later, after backup/restore                                                           |
 | Environment/model diagnostics  | Keep in Activity/Settings, not a global identity bar                          | Baseline implemented                                                                  |
 | Dense charts/heatmaps          | Only with responsive reflow, text/table alternatives, and reduced motion      | Selectively later                                                                     |
@@ -303,20 +346,14 @@ primitives needed to make sync safe.
 
 ## Recommended execution order
 
-1. Finish and fully verify archive import plus the portal-inspired frontend slice.
-2. Close the round-12 regression/privacy evidence and activate CI.
-3. Add feed discovery and OPML import.
-4. Add pause/resume, rename, and bounded per-source sync/retry.
-5. Add fair configurable editions and previous-edition history.
-6. Add local Search/Recall, then Saved and the Library surface.
-7. Add the installed-model picker.
-8. Add item-detail/source-navigation refinements.
-9. Add backup/export/restore.
-10. Add tray/close-to-hide and native lifecycle evidence.
-11. Build and validate Mastodon.
-12. Build and validate Bluesky.
-13. Complete signing, updater, supply-chain, and clean-host release gates.
-14. Revisit peer sync only after backup/restore and privacy tombstones are proven.
+1. Close archive, backup/restore, tray, and source-lifecycle acceptance in packaged native builds.
+2. Activate CI and obtain fresh three-host matrix evidence.
+3. Add failed-row OPML retry/edit and Library keyboard/assistive refinements.
+4. Add item-detail/source-navigation refinements.
+5. Build and validate Mastodon.
+6. Build and validate Bluesky.
+7. Complete signing, updater, supply-chain, and clean-host release gates.
+8. Revisit peer sync only after backup/restore and privacy tombstones are proven.
 
 ## Definition of done
 

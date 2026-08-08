@@ -16,6 +16,9 @@ pub struct Dashboard {
     pub host: HostCapabilities,
     pub runner: RunnerStatus,
     pub connectors: Vec<ConnectorDescriptor>,
+    pub history: Vec<EditionSummary>,
+    pub library: LibraryStats,
+    pub since_last_edition: SinceLastEdition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +29,107 @@ pub struct Edition {
     pub generated_at: String,
     pub next_edition_at: Option<String>,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditionSummary {
+    pub id: String,
+    pub label: String,
+    pub generated_at: String,
+    pub summary: String,
+    pub item_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditionDetail {
+    pub edition: Edition,
+    pub items: Vec<DigestItem>,
+    pub trends: Vec<Trend>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryStats {
+    pub saved_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SinceLastEdition {
+    pub new_items: i64,
+    pub new_sources: i64,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryItem {
+    pub id: String,
+    pub source_id: String,
+    pub source: String,
+    pub author: String,
+    pub title: String,
+    pub excerpt: String,
+    pub published_at: String,
+    pub canonical_url: Option<String>,
+    pub saved: bool,
+    pub source_status: String,
+    pub source_health_detail: String,
+    pub summary_method: Option<String>,
+    pub summary_provider: Option<String>,
+    pub summary_uncertainty: Option<String>,
+}
+
+/// A portable, person-readable representation of explicitly saved items. Database identifiers and
+/// transient source-health diagnostics intentionally stay local to avoid turning an export into an
+/// internal database dump.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLibraryExport {
+    pub format: String,
+    pub schema_version: u8,
+    pub exported_at: String,
+    pub items: Vec<SavedLibraryExportItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLibraryExportItem {
+    pub source: String,
+    pub author: String,
+    pub title: String,
+    pub excerpt: String,
+    pub published_at: String,
+    pub canonical_url: Option<String>,
+    pub summary_method: Option<String>,
+    pub summary_provider: Option<String>,
+    pub summary_uncertainty: Option<String>,
+}
+
+impl SavedLibraryExport {
+    pub fn new(exported_at: String, items: Vec<LibraryItem>) -> Self {
+        Self {
+            format: "web-saved-items".to_owned(),
+            schema_version: 1,
+            exported_at,
+            items: items
+                .into_iter()
+                .map(|item| SavedLibraryExportItem {
+                    source: item.source,
+                    author: item.author,
+                    title: item.title,
+                    excerpt: item.excerpt,
+                    published_at: item.published_at,
+                    canonical_url: item.canonical_url,
+                    summary_method: item.summary_method,
+                    summary_provider: item.summary_provider,
+                    summary_uncertainty: item.summary_uncertainty,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +240,14 @@ pub struct Settings {
     /// `selected_model`.
     #[serde(default)]
     pub ranking_paused: bool,
+    #[serde(default = "default_edition_size")]
+    pub edition_size: u8,
+    #[serde(default)]
+    pub close_to_tray: bool,
+}
+
+const fn default_edition_size() -> u8 {
+    12
 }
 
 impl Default for Settings {
@@ -151,6 +263,8 @@ impl Default for Settings {
             feedback_count: 0,
             selected_model: String::new(),
             ranking_paused: false,
+            edition_size: default_edition_size(),
+            close_to_tray: false,
         }
     }
 }
@@ -390,6 +504,89 @@ pub struct ResetLearningRequest {
     pub request_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetSavedRequest {
+    pub request_id: String,
+    pub post_id: String,
+    pub saved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchLibraryRequest {
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenameSourceRequest {
+    pub request_id: String,
+    pub source_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetSourcePausedRequest {
+    pub request_id: String,
+    pub source_id: String,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncSourceRequest {
+    pub request_id: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpmlCandidate {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscoverFeedsRequest {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProbeMastodonInstanceRequest {
+    pub instance_url: String,
+}
+
+/// Native-only connection input. There is intentionally no renderer transport method or invoke
+/// registration yet: a stored authorization remains paused until read-only timeline ingestion and
+/// its deletion/rollback acceptance coverage are ready.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectMastodonRequest {
+    pub request_id: String,
+    pub label: String,
+    pub instance_url: String,
+}
+
+/// A compatibility receipt, not an account connection. Keeping this separate from Source prevents
+/// a successful preflight check from looking like social data or a stored authorization.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MastodonProbeResult {
+    pub instance_url: String,
+    pub supported_scopes: Vec<String>,
+    pub connection_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreBackupRequest {
+    pub request_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppError {
@@ -410,6 +607,10 @@ impl AppError {
 
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new("CONFLICT", message, false)
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new("UNAVAILABLE", message, true)
     }
 
     pub fn internal() -> Self {

@@ -11,9 +11,9 @@ use crate::connectors::{
     validate_source_sync_spec,
 };
 use crate::domain::{
-    Activity, AppError, AppResult, Dashboard, DigestItem, Edition, Evidence, FeedbackSignal,
-    HostCapabilities, ModelStatus, RunnerStatus, Settings, Source, TimestampKind, Trend,
-    TrendMethod,
+    Activity, AppError, AppResult, Dashboard, DigestItem, Edition, EditionDetail, EditionSummary,
+    Evidence, FeedbackSignal, HostCapabilities, LibraryItem, LibraryStats, ModelStatus,
+    RunnerStatus, Settings, SinceLastEdition, Source, TimestampKind, Trend, TrendMethod,
 };
 use crate::inference::GroundedSummary;
 
@@ -118,7 +118,10 @@ const MIGRATION_10: &str = include_str!("../migrations/0010_comment_finality_pro
 const MIGRATION_11: &str = include_str!("../migrations/0011_comment_activation_closure.sql");
 const MIGRATION_12: &str = include_str!("../migrations/0012_comment_identity_ledger.sql");
 const MIGRATION_13: &str = include_str!("../migrations/0013_export_import.sql");
-const LATEST_SCHEMA_VERSION: i64 = 13;
+const MIGRATION_14: &str = include_str!("../migrations/0014_daily_use.sql");
+const MIGRATION_15: &str = include_str!("../migrations/0015_comment_identity_fingerprints.sql");
+const MIGRATION_16: &str = include_str!("../migrations/0016_mastodon_vault_recovery.sql");
+const LATEST_SCHEMA_VERSION: i64 = 16;
 
 pub struct Database {
     connection: Connection,
@@ -144,6 +147,19 @@ impl Database {
 
     pub fn memory() -> Result<Self, rusqlite::Error> {
         Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    pub fn backup_to(&self, path: &Path) -> AppResult<()> {
+        let value = path
+            .to_str()
+            .ok_or_else(|| AppError::validation("The chosen backup path is not supported."))?;
+        if value.len() > 8_000 {
+            return Err(AppError::validation("The chosen backup path is too long."));
+        }
+        self.connection
+            .execute("VACUUM INTO ?1", [value])
+            .map_err(|_| AppError::internal())?;
+        Ok(())
     }
 
     fn from_connection(connection: Connection) -> Result<Self, rusqlite::Error> {
@@ -223,6 +239,49 @@ impl Database {
                 transaction.commit()?;
             }
             connection.pragma_update(None, "foreign_keys", true)?;
+        }
+        let current_after_13: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_after_13 < 14 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_14)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(14, ?1)",
+                params![Utc::now().timestamp_millis()],
+            )?;
+            transaction.commit()?;
+        }
+        let current_after_14: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_after_14 < 15 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_15)?;
+            migrate_comment_identity_ledger(&transaction)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(15, ?1)",
+                params![Utc::now().timestamp_millis()],
+            )?;
+            transaction.commit()?;
+        }
+        let current_after_15: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_after_15 < 16 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_16)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?1)",
+                params![Utc::now().timestamp_millis()],
+            )?;
+            transaction.commit()?;
         }
         let mut database = Self { connection };
         database.initialize_empty_state()?;
@@ -379,6 +438,48 @@ impl Database {
         );
     }
 
+    /// Records a non-secret vault reference before a credential write. This is intentionally
+    /// separate from source creation: a credential provider can time out after accepting a write,
+    /// and startup uses this durable reference to compensate without retaining token material.
+    pub fn record_pending_vault_cleanup(
+        &self,
+        request_id: &str,
+        secret_ref: &str,
+    ) -> AppResult<()> {
+        validate_id(request_id)?;
+        validate_id(secret_ref)?;
+        self.connection
+            .execute(
+                "INSERT INTO pending_vault_cleanup(request_id, secret_ref, created_at) VALUES(?1, ?2, ?3)",
+                params![request_id, secret_ref, Utc::now().timestamp_millis()],
+            )
+            .map_err(|_| AppError::internal())?;
+        Ok(())
+    }
+
+    pub fn pending_vault_cleanups(&self) -> AppResult<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT request_id, secret_ref FROM pending_vault_cleanup ORDER BY created_at")
+            .map_err(|_| AppError::internal())?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|_| AppError::internal())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AppError::internal())
+    }
+
+    pub fn clear_pending_vault_cleanup(&self, request_id: &str) -> AppResult<()> {
+        validate_id(request_id)?;
+        self.connection
+            .execute(
+                "DELETE FROM pending_vault_cleanup WHERE request_id=?1",
+                [request_id],
+            )
+            .map_err(|_| AppError::internal())?;
+        Ok(())
+    }
+
     /// Seal an interrupted request without claiming that all of its effects are known. The
     /// command-only tombstone prevents replay while disclosing no source or payload identity.
     pub fn seal_request_unknown(&self, request_id: &str, command: &str) -> AppResult<()> {
@@ -427,6 +528,18 @@ impl Database {
             .map_err(|_| AppError::internal())?;
         let sources = self.load_sources().map_err(|_| AppError::internal())?;
         let activity = self.load_activity().map_err(|_| AppError::internal())?;
+        let history = self
+            .load_edition_history()
+            .map_err(|_| AppError::internal())?;
+        let library = LibraryStats {
+            saved_count: self
+                .connection
+                .query_row("SELECT COUNT(*) FROM saved_posts", [], |row| row.get(0))
+                .unwrap_or(0),
+        };
+        let since_last_edition = self
+            .since_last_edition(&edition)
+            .map_err(|_| AppError::internal())?;
         let mut settings = self.load_settings().map_err(|_| AppError::internal())?;
         settings.feedback_count = self
             .connection
@@ -459,6 +572,9 @@ impl Database {
                 .load_runner_status(false, false)
                 .map_err(|_| AppError::internal())?,
             connectors: crate::connectors::connector_descriptors(),
+            history,
+            library,
+            since_last_edition,
         })
     }
 
@@ -486,7 +602,8 @@ impl Database {
         {
             return Ok(());
         }
-        let ranking_paused = self.load_settings().unwrap_or_default().ranking_paused;
+        let settings = self.load_settings().unwrap_or_default();
+        let ranking_paused = settings.ranking_paused;
         let transaction = self
             .connection
             .transaction()
@@ -511,10 +628,10 @@ impl Database {
                     FROM posts p WHERE p.deleted_at IS NULL
                     AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.post_id=p.id AND f.signal='not_relevant' AND f.retracted_at IS NULL)
                     AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.source_id=p.source_id AND f.signal='mute_source' AND f.retracted_at IS NULL)
-                 ) WHERE source_rank <= 2 ORDER BY published_at DESC, id LIMIT 8"
+                 ) WHERE source_rank <= 2 ORDER BY source_rank ASC, published_at DESC, id LIMIT ?1"
             ).map_err(|_| AppError::internal())?;
             let candidates = statement
-                .query_map([], |row| {
+                .query_map([i64::from(settings.edition_size)], |row| {
                     Ok(crate::ranking::CandidatePost {
                         post_id: row.get::<_, String>(0)?,
                         source_id: row.get::<_, String>(1)?,
@@ -628,6 +745,7 @@ impl Database {
             || settings.quiet_hours_start > 23
             || settings.quiet_hours_end > 23
             || !(1..=365).contains(&settings.retention_days)
+            || !(10..=40).contains(&settings.edition_size)
             || (settings.schedule_enabled
                 && crate::scheduler::in_quiet_hours(
                     u32::from(settings.schedule_hour),
@@ -778,6 +896,94 @@ impl Database {
             .map_err(|_| AppError::internal())?;
         transaction.commit().map_err(|_| AppError::internal())?;
         Ok((source_id, changed))
+    }
+
+    /// Atomically makes a vault-backed Mastodon source visible and completes its external-command
+    /// receipt. The matching pending cleanup row proves the credential write was prepared first;
+    /// token bytes never enter this database.
+    pub fn add_mastodon_source(
+        &mut self,
+        request_id: &str,
+        source_id: &str,
+        label: &str,
+        instance_url: &str,
+        secret_ref: &str,
+    ) -> AppResult<()> {
+        validate_id(request_id)?;
+        validate_id(source_id)?;
+        validate_id(secret_ref)?;
+        validate_source_label(label)?;
+        let instance =
+            crate::connectors::validate_mastodon_instance_url(instance_url).map_err(|_| {
+                AppError::validation(
+                    "The Mastodon instance is no longer a public HTTPS instance root.",
+                )
+            })?;
+        let now = Utc::now().timestamp_millis();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| AppError::internal())?;
+        let pending = transaction
+            .query_row(
+                "SELECT secret_ref FROM pending_vault_cleanup WHERE request_id=?1",
+                [request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| AppError::internal())?;
+        if pending.as_deref() != Some(secret_ref) {
+            return Err(AppError::conflict(
+                "This connection no longer has a recoverable credential handoff.",
+            ));
+        }
+        let prior_generation = transaction
+            .query_row(
+                "SELECT generation FROM source_tombstones WHERE source_id=?1",
+                [source_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|_| AppError::internal())?
+            .unwrap_or(0);
+        let config = serde_json::to_string(&serde_json::json!({
+            "instance_url": instance.to_string(),
+            "activation": "foundation_only"
+        }))
+        .map_err(|_| AppError::internal())?;
+        transaction
+            .execute(
+                "INSERT INTO sources(id, connector_kind, account_label, detail, status, config_json, secret_ref, next_poll_at, created_at, updated_at, generation)
+                 VALUES(?1, 'mastodon', ?2, 'Mastodon · read-only authorization stored locally; bounded timeline synchronization is ready.', 'healthy', ?3, ?4, ?5, ?6, ?6, ?7)",
+                params![source_id, label.trim(), config, secret_ref, now + Duration::hours(6).num_milliseconds(), now, prior_generation.saturating_add(1)],
+            )
+            .map_err(|_| AppError::conflict("That Mastodon source is already connected."))?;
+        transaction
+            .execute(
+                "INSERT INTO source_sync_metadata(source_id, health_state, safe_detail, comments_status, comments_truncated, retry_at, updated_at, page_finality)
+                 VALUES(?1, 'healthy', 'Authorization completed. Use Sync now to collect a bounded read-only timeline.', 'unavailable', 0, ?2, ?3, 'complete')",
+                params![source_id, now + Duration::hours(6).num_milliseconds(), now],
+            )
+            .map_err(|_| AppError::internal())?;
+        transaction
+            .execute(
+                "INSERT INTO receipt_sources(request_id, source_id) VALUES(?1, ?2)",
+                params![request_id, source_id],
+            )
+            .map_err(|_| AppError::internal())?;
+        transaction
+            .execute(
+                "DELETE FROM pending_vault_cleanup WHERE request_id=?1",
+                [request_id],
+            )
+            .map_err(|_| AppError::internal())?;
+        transaction
+            .execute(
+                "UPDATE request_receipts SET state='complete', completed_at=?1 WHERE request_id=?2 AND command='connect_mastodon' AND state='pending'",
+                params![now, request_id],
+            )
+            .map_err(|_| AppError::internal())?;
+        transaction.commit().map_err(|_| AppError::internal())
     }
 
     /// Finds only archive posts whose content needs new summary preparation. Archive sources never
@@ -1263,6 +1469,97 @@ impl Database {
         Ok((rows.into_iter().take(cap).collect(), capped))
     }
 
+    /// Portable exports include every configured RSS source, including paused sources. Archive
+    /// imports and future authenticated connectors are intentionally excluded: OPML represents
+    /// public feed subscriptions, not an opaque copy of a social account.
+    pub fn opml_export_sources(&self) -> AppResult<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT account_label, config_json FROM sources
+                 WHERE connector_kind='rss' ORDER BY account_label COLLATE NOCASE, id",
+            )
+            .map_err(|_| AppError::internal())?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| AppError::internal())?
+            .map(|row| {
+                let (label, config) = row.map_err(|_| AppError::internal())?;
+                let url = serde_json::from_str::<serde_json::Value>(&config)
+                    .ok()
+                    .and_then(|value| value.get("url")?.as_str().map(ToOwned::to_owned))
+                    .filter(|url| crate::connectors::validate_public_feed_url(url).is_ok())
+                    .ok_or_else(|| {
+                        AppError::validation("An RSS source is missing a safe export URL.")
+                    })?;
+                Ok((label, url))
+            })
+            .collect()
+    }
+
+    pub fn rss_source(&self, source_id: &str) -> AppResult<RssSourceSpec> {
+        validate_id(source_id)?;
+        self.connection
+            .query_row(
+                "SELECT id, generation, account_label, config_json, validator_url, etag, last_modified
+                 FROM sources WHERE id=?1 AND connector_kind='rss' AND status!='paused'",
+                [source_id],
+                |row| {
+                    let config: String = row.get(3)?;
+                    let requested_url = serde_json::from_str::<serde_json::Value>(&config)
+                        .ok()
+                        .and_then(|value| value.get("url").and_then(|url| url.as_str()).map(ToOwned::to_owned))
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    Ok(RssSourceSpec {
+                        id: row.get(0)?, generation: row.get(1)?, label: row.get(2)?, requested_url,
+                        effective_url: row.get(4)?, etag: row.get(5)?, last_modified: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| AppError::internal())?
+            .ok_or_else(|| AppError::validation("This source is unavailable or paused. Resume it before synchronizing."))
+    }
+
+    /// Privileged connector dispatch uses this typed source snapshot rather than renderer-supplied
+    /// configuration. It intentionally excludes paused sources, including a newly authorized
+    /// Mastodon account whose timeline activation has not passed its release gates.
+    pub fn connector_source(&self, source_id: &str) -> AppResult<SourceSyncSpec> {
+        validate_id(source_id)?;
+        self.connection
+            .query_row(
+                "SELECT id, connector_kind, generation, config_json, sync_cursor
+                 FROM sources WHERE id=?1 AND connector_kind IN ('rss', 'mastodon', 'bluesky')
+                   AND status!='paused'",
+                [source_id],
+                |row| {
+                    let kind: String = row.get(1)?;
+                    let kind = match kind.as_str() {
+                        "rss" => SourceKind::Rss,
+                        "mastodon" => SourceKind::Mastodon,
+                        "bluesky" => SourceKind::Bluesky,
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
+                    Ok(SourceSyncSpec {
+                        id: row.get(0)?,
+                        kind,
+                        generation: row.get(2)?,
+                        config_json: row.get(3)?,
+                        cursor: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| AppError::internal())?
+            .ok_or_else(|| {
+                AppError::validation(
+                    "This source is unavailable or paused. Resume it before synchronizing.",
+                )
+            })
+    }
+
     pub fn complete_not_modified(
         &mut self,
         source: &RssSourceSpec,
@@ -1695,6 +1992,265 @@ impl Database {
             "SELECT id, label, generated_at, overview FROM digests WHERE status='ready' ORDER BY generated_at DESC, rowid DESC LIMIT 1",
             [], |row| Ok(Edition { id: row.get(0)?, label: row.get(1)?, generated_at: iso(row.get(2)?), next_edition_at: None, summary: row.get(3)? }),
         )
+    }
+
+    fn load_edition_history(&self) -> rusqlite::Result<Vec<EditionSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT d.id, d.label, d.generated_at, d.overview, COUNT(di.post_id)
+             FROM digests d LEFT JOIN digest_items di ON di.digest_id=d.id
+             WHERE d.status='ready'
+             GROUP BY d.id ORDER BY d.generated_at DESC, d.rowid DESC LIMIT 12",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(EditionSummary {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    generated_at: iso(row.get(2)?),
+                    summary: row.get(3)?,
+                    item_count: row.get(4)?,
+                })
+            })?
+            .collect()
+    }
+
+    fn since_last_edition(&self, current: &Edition) -> rusqlite::Result<SinceLastEdition> {
+        let previous: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT generated_at FROM digests
+                 WHERE status='ready' AND period_start < period_end AND id!=?1
+                 ORDER BY generated_at DESC, rowid DESC LIMIT 1",
+                [&current.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(previous) = previous else {
+            return Ok(SinceLastEdition {
+                new_items: 0,
+                new_sources: 0,
+                detail: "This is your first retained edition.".into(),
+            });
+        };
+        let current_at = chrono::DateTime::parse_from_rfc3339(&current.generated_at)
+            .map(|value| value.timestamp_millis())
+            .unwrap_or(i64::MAX);
+        let new_items = self.connection.query_row(
+            "SELECT COUNT(*) FROM posts WHERE deleted_at IS NULL AND fetched_at>?1 AND fetched_at<=?2",
+            params![previous, current_at],
+            |row| row.get(0),
+        )?;
+        let new_sources = self.connection.query_row(
+            "SELECT COUNT(*) FROM sources WHERE created_at>?1 AND created_at<=?2",
+            params![previous, current_at],
+            |row| row.get(0),
+        )?;
+        Ok(SinceLastEdition {
+            new_items,
+            new_sources,
+            detail: format!(
+                "Since your previous retained edition: {new_items} new local item{} from {new_sources} new source{}.",
+                if new_items == 1 { "" } else { "s" },
+                if new_sources == 1 { "" } else { "s" },
+            ),
+        })
+    }
+
+    pub fn edition_detail(&self, edition_id: &str) -> AppResult<EditionDetail> {
+        validate_id(edition_id)?;
+        let edition = self.connection.query_row(
+            "SELECT id, label, generated_at, overview FROM digests WHERE id=?1 AND status='ready'",
+            [edition_id],
+            |row| Ok(Edition { id: row.get(0)?, label: row.get(1)?, generated_at: iso(row.get(2)?), next_edition_at: None, summary: row.get(3)? }),
+        ).optional().map_err(|_| AppError::internal())?
+          .ok_or_else(|| AppError::not_found("That edition is no longer available."))?;
+        Ok(EditionDetail {
+            items: self
+                .load_items(&edition.id)
+                .map_err(|_| AppError::internal())?,
+            trends: self
+                .load_trends(&edition.id)
+                .map_err(|_| AppError::internal())?,
+            edition,
+        })
+    }
+
+    pub fn search_library(&self, query: &str) -> AppResult<Vec<LibraryItem>> {
+        let terms = query
+            .split_whitespace()
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        if terms.is_empty() || query.len() > 200 {
+            return Err(AppError::validation(
+                "Enter up to 200 characters to search your local library.",
+            ));
+        }
+        // Quoted tokens make punctuation inert while retaining FTS prefix matching for ordinary words.
+        let match_query = terms
+            .iter()
+            .map(|term| format!("\"{}\"*", term.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let mut statement = self.connection.prepare(
+            "SELECT p.id, p.source_id, s.account_label, COALESCE(a.display_name, s.account_label),
+                    p.title, substr(p.body_text, 1, 420), p.published_at, p.canonical_http_url,
+                    EXISTS(SELECT 1 FROM saved_posts sp WHERE sp.post_id=p.id),
+                    COALESCE(m.health_state, CASE s.status WHEN 'paused' THEN 'paused' WHEN 'attention' THEN 'transient' ELSE 'healthy' END),
+                    COALESCE(m.safe_detail, ''), su.summary_method, su.provider, su.uncertainty
+             FROM post_search ps JOIN posts p ON p.id=ps.post_id JOIN sources s ON s.id=p.source_id
+             LEFT JOIN actors a ON a.id=p.actor_id
+             LEFT JOIN source_sync_metadata m ON m.source_id=s.id
+             LEFT JOIN post_comment_state pcs ON pcs.post_id=p.id
+             LEFT JOIN summaries su ON su.id=(SELECT s2.id FROM summaries s2 WHERE s2.post_id=p.id AND s2.input_hash=COALESCE(NULLIF(pcs.summary_input_hash, ''), p.content_hash) ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
+             WHERE post_search MATCH ?1 AND p.deleted_at IS NULL
+             ORDER BY bm25(post_search), p.published_at DESC LIMIT 50",
+        ).map_err(|_| AppError::internal())?;
+        statement
+            .query_map([match_query], |row| {
+                Ok(LibraryItem {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    source: row.get(2)?,
+                    author: row.get(3)?,
+                    title: row.get(4)?,
+                    excerpt: row.get(5)?,
+                    published_at: iso(row.get(6)?),
+                    canonical_url: row.get(7)?,
+                    saved: row.get::<_, i64>(8)? != 0,
+                    source_status: row.get(9)?,
+                    source_health_detail: row.get(10)?,
+                    summary_method: row.get(11)?,
+                    summary_provider: row.get(12)?,
+                    summary_uncertainty: row.get(13)?,
+                })
+            })
+            .map_err(|_| AppError::internal())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AppError::internal())
+    }
+
+    fn saved_library_with_limit(&self, limit: Option<usize>) -> AppResult<Vec<LibraryItem>> {
+        let limit_clause = limit
+            .map(|value| format!(" LIMIT {value}"))
+            .unwrap_or_default();
+        let query = format!(
+            "SELECT p.id, p.source_id, s.account_label, COALESCE(a.display_name, s.account_label),
+                    p.title, substr(p.body_text, 1, 420), p.published_at, p.canonical_http_url, 1,
+                    COALESCE(m.health_state, CASE s.status WHEN 'paused' THEN 'paused' WHEN 'attention' THEN 'transient' ELSE 'healthy' END),
+                    COALESCE(m.safe_detail, ''), su.summary_method, su.provider, su.uncertainty
+             FROM saved_posts sp JOIN posts p ON p.id=sp.post_id JOIN sources s ON s.id=p.source_id
+             LEFT JOIN actors a ON a.id=p.actor_id LEFT JOIN source_sync_metadata m ON m.source_id=s.id
+             LEFT JOIN post_comment_state pcs ON pcs.post_id=p.id
+             LEFT JOIN summaries su ON su.id=(SELECT s2.id FROM summaries s2 WHERE s2.post_id=p.id AND s2.input_hash=COALESCE(NULLIF(pcs.summary_input_hash, ''), p.content_hash) ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
+             WHERE p.deleted_at IS NULL
+             ORDER BY sp.saved_at DESC{limit_clause}"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|_| AppError::internal())?;
+        statement
+            .query_map([], |row| {
+                Ok(LibraryItem {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    source: row.get(2)?,
+                    author: row.get(3)?,
+                    title: row.get(4)?,
+                    excerpt: row.get(5)?,
+                    published_at: iso(row.get(6)?),
+                    canonical_url: row.get(7)?,
+                    saved: row.get::<_, i64>(8)? != 0,
+                    source_status: row.get(9)?,
+                    source_health_detail: row.get(10)?,
+                    summary_method: row.get(11)?,
+                    summary_provider: row.get(12)?,
+                    summary_uncertainty: row.get(13)?,
+                })
+            })
+            .map_err(|_| AppError::internal())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AppError::internal())
+    }
+
+    pub fn saved_library(&self) -> AppResult<Vec<LibraryItem>> {
+        self.saved_library_with_limit(Some(100))
+    }
+
+    pub fn saved_library_export(&self) -> AppResult<Vec<LibraryItem>> {
+        self.saved_library_with_limit(None)
+    }
+
+    pub fn set_saved(&mut self, request_id: &str, post_id: &str, saved: bool) -> AppResult<()> {
+        validate_id(request_id)?;
+        validate_id(post_id)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| AppError::internal())?;
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM posts WHERE id=?1 AND deleted_at IS NULL",
+                [post_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| AppError::internal())?
+            .is_some();
+        if !exists {
+            return Err(AppError::not_found(
+                "That saved item is no longer retained locally.",
+            ));
+        }
+        if saved {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO saved_posts(post_id, saved_at) VALUES(?1, ?2)",
+                    params![post_id, Utc::now().timestamp_millis()],
+                )
+                .map_err(|_| AppError::internal())?;
+        } else {
+            transaction
+                .execute("DELETE FROM saved_posts WHERE post_id=?1", [post_id])
+                .map_err(|_| AppError::internal())?;
+        }
+        transaction.commit().map_err(|_| AppError::internal())
+    }
+
+    pub fn rename_source(&mut self, source_id: &str, label: &str) -> AppResult<()> {
+        validate_id(source_id)?;
+        validate_source_label(label)?;
+        let changed = self.connection.execute(
+            "UPDATE sources SET account_label=?1, generation=generation+1, updated_at=?2 WHERE id=?3",
+            params![label.trim(), Utc::now().timestamp_millis(), source_id],
+        ).map_err(|_| AppError::internal())?;
+        if changed != 1 {
+            return Err(AppError::not_found("That source is already disconnected."));
+        }
+        Ok(())
+    }
+
+    pub fn set_source_paused(&mut self, source_id: &str, paused: bool) -> AppResult<()> {
+        validate_id(source_id)?;
+        let now = Utc::now().timestamp_millis();
+        let changed = self.connection.execute(
+            "UPDATE sources SET status=CASE WHEN ?1 THEN 'paused' ELSE 'healthy' END,
+                next_poll_at=CASE WHEN ?1 THEN NULL ELSE ?2 END, generation=generation+1, updated_at=?2
+             WHERE id=?3 AND connector_kind='rss'",
+            params![i64::from(paused), now, source_id],
+        ).map_err(|_| AppError::internal())?;
+        if changed != 1 {
+            return Err(AppError::validation(
+                "Only connected RSS/Atom sources can be paused or resumed.",
+            ));
+        }
+        self.connection.execute(
+            "UPDATE source_sync_metadata SET health_state=CASE WHEN ?1 THEN 'paused' ELSE 'healthy' END,
+             safe_detail=CASE WHEN ?1 THEN 'Paused locally. No fetches will run.' ELSE 'Resumed locally; eligible for a bounded sync.' END,
+             retry_at=CASE WHEN ?1 THEN NULL ELSE ?2 END, updated_at=?2 WHERE source_id=?3",
+            params![i64::from(paused), now, source_id],
+        ).map_err(|_| AppError::internal())?;
+        Ok(())
     }
 
     fn load_items(&self, digest_id: &str) -> rusqlite::Result<Vec<DigestItem>> {
@@ -2179,24 +2735,70 @@ fn load_stored_comments(
         .map_err(|_| AppError::internal())
 }
 
+fn comment_identity_fingerprint(source_id: &str, identity_kind: &str, remote_id: &str) -> String {
+    // `source_id` namespaces an opaque provider identifier so an accidental cross-source reuse
+    // cannot correlate rows in the durable ledger. The ledger carries no raw provider ID after
+    // migration; full IDs live only with retained comments/posts needed for current reconciliation.
+    content_hash(&format!(
+        "web-comment-identity-v1\0{source_id}\0{identity_kind}\0{remote_id}"
+    ))
+}
+
+fn migrate_comment_identity_ledger(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    let legacy_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT source_id, remote_id, post_remote_id, first_seen_generation
+             FROM comment_identity_ledger_v12_raw",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (source_id, remote_id, post_remote_id, generation) in legacy_rows {
+        transaction.execute(
+            "INSERT INTO comment_identity_ledger
+             (source_id, comment_fingerprint, post_fingerprint, first_seen_generation)
+             VALUES(?1, ?2, ?3, ?4)",
+            params![
+                source_id,
+                comment_identity_fingerprint(&source_id, "comment", &remote_id),
+                comment_identity_fingerprint(&source_id, "post", &post_remote_id),
+                generation,
+            ],
+        )?;
+    }
+    transaction.execute_batch("DROP TABLE comment_identity_ledger_v12_raw;")
+}
+
 fn assert_comment_id_assignments(
     connection: &Connection,
     source_id: &str,
     batch: &SyncBatch,
 ) -> AppResult<()> {
     for comment in &batch.comments {
+        let comment_fingerprint =
+            comment_identity_fingerprint(source_id, "comment", &comment.remote_id);
+        let post_fingerprint =
+            comment_identity_fingerprint(source_id, "post", &comment.post_remote_id);
         let existing_post = connection
             .query_row(
-                "SELECT post_remote_id FROM comment_identity_ledger
-                 WHERE source_id=?1 AND remote_id=?2",
-                params![source_id, comment.remote_id],
+                "SELECT post_fingerprint FROM comment_identity_ledger
+                 WHERE source_id=?1 AND comment_fingerprint=?2",
+                params![source_id, comment_fingerprint],
                 |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(|_| AppError::internal())?;
         if existing_post
             .as_deref()
-            .is_some_and(|post_remote_id| post_remote_id != comment.post_remote_id)
+            .is_some_and(|stored_post| stored_post != post_fingerprint)
         {
             return Err(AppError::conflict(
                 "A provider comment identifier cannot move between posts.",
@@ -2212,15 +2814,19 @@ fn insert_comment_identities(
     batch: &SyncBatch,
 ) -> AppResult<()> {
     for comment in &batch.comments {
+        let comment_fingerprint =
+            comment_identity_fingerprint(&source.id, "comment", &comment.remote_id);
+        let post_fingerprint =
+            comment_identity_fingerprint(&source.id, "post", &comment.post_remote_id);
         transaction
             .execute(
                 "INSERT OR IGNORE INTO comment_identity_ledger
-                 (source_id, remote_id, post_remote_id, first_seen_generation)
+                 (source_id, comment_fingerprint, post_fingerprint, first_seen_generation)
                  SELECT id, ?1, ?2, generation FROM sources
                  WHERE id=?3 AND generation=?4 AND connector_kind=?5",
                 params![
-                    comment.remote_id,
-                    comment.post_remote_id,
+                    comment_fingerprint,
+                    post_fingerprint,
                     source.id,
                     source.generation,
                     source_kind_str(source.kind)
@@ -2837,7 +3443,13 @@ fn apply_retention_in_transaction(
             params![now_ms, source_id],
         )?;
     }
-    transaction.execute("DELETE FROM posts WHERE fetched_at < ?1", [cutoff])?;
+    // Saved items are an explicit read-later promise, not a passive signal. They remain
+    // available until the person unsaves them or deletes their source; the UI exposes this
+    // retention exception in Library and export copy.
+    transaction.execute(
+        "DELETE FROM posts WHERE fetched_at < ?1 AND NOT EXISTS (SELECT 1 FROM saved_posts sp WHERE sp.post_id=posts.id)",
+        [cutoff],
+    )?;
     transaction.execute(
         "DELETE FROM actors WHERE NOT EXISTS (SELECT 1 FROM posts WHERE posts.actor_id=actors.id)
          AND NOT EXISTS (SELECT 1 FROM comments WHERE comments.actor_id=actors.id)",
@@ -2955,6 +3567,25 @@ mod tests {
         }
     }
 
+    fn prepared_from_candidates(candidates: Vec<InferenceCandidate>) -> Vec<PreparedPost> {
+        candidates
+            .into_iter()
+            .map(|candidate| PreparedPost {
+                post: candidate.post,
+                input_hash: candidate.input_hash,
+                summary: GroundedSummary {
+                    summary: "Deterministic evidence.".into(),
+                    comment_overview: "Bounded comment evidence.".into(),
+                    uncertainty: "Deterministic fallback.".into(),
+                },
+                provider: "deterministic-fallback".into(),
+                model_id: None,
+                prompt_version: "extractive-v1".into(),
+                summary_method: "extractive".into(),
+            })
+            .collect()
+    }
+
     fn fallback_prepared(post: NormalizedPost) -> PreparedPost {
         let input_hash =
             summary_input_hash_for(&post, &[], CommentCompleteness::Unavailable, false);
@@ -2990,6 +3621,152 @@ mod tests {
              SELECT ?1, ?2, 'Current evidence.', 'No comments.', json_array(?2), 'deterministic-fallback', 'extractive-v1', content_hash, ?3, 'extractive', 'Fallback.' FROM posts WHERE id=?2",
             params![format!("summary-{post_id}"), post_id, now],
         ).expect("summary");
+    }
+
+    #[test]
+    fn local_library_search_and_explicit_saved_retention_follow_privacy_deletion() {
+        let mut database = Database::memory().expect("database");
+        seed_post(&mut database, "library-source", "library-post");
+
+        let found = database.search_library("Current evidence").expect("search");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "library-post");
+        assert!(!found[0].saved);
+        assert_eq!(found[0].source_status, "healthy");
+        assert_eq!(found[0].summary_method.as_deref(), Some("extractive"));
+        assert_eq!(found[0].summary_uncertainty.as_deref(), Some("Fallback."));
+
+        database
+            .set_saved("save-library-post", "library-post", true)
+            .expect("save");
+        database
+            .connection
+            .execute("UPDATE posts SET fetched_at=0 WHERE id='library-post'", [])
+            .expect("age post");
+        let settings = Settings {
+            retention_days: 1,
+            ..Settings::default()
+        };
+        database
+            .update_settings("library-retention", &settings)
+            .expect("apply retention");
+        assert_eq!(database.saved_library().expect("saved").len(), 1);
+        assert_eq!(
+            database
+                .dashboard(model(), host())
+                .expect("dashboard")
+                .library
+                .saved_count,
+            1,
+            "an explicit saved item survives ordinary retention"
+        );
+
+        database
+            .delete_source("delete-library-source", "library-source")
+            .expect("privacy delete");
+        assert!(
+            database
+                .saved_library()
+                .expect("saved after deletion")
+                .is_empty()
+        );
+        assert!(
+            database
+                .search_library("Current evidence")
+                .expect("search after deletion")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn portable_saved_export_includes_items_beyond_the_library_display_cap() {
+        let mut database = Database::memory().expect("database");
+        seed_post(&mut database, "export-source", "export-post-0");
+        database
+            .set_saved("save-export-post-0", "export-post-0", true)
+            .expect("save first post");
+        let now = Utc::now().timestamp_millis();
+        for index in 1..=100 {
+            let post_id = format!("export-post-{index}");
+            database
+                .connection
+                .execute(
+                    "INSERT INTO posts(id, source_id, remote_id, canonical_url, canonical_http_url, title, body_text, published_at, published_time_kind, fetched_at, content_hash)
+                     VALUES(?1, 'export-source', ?1, 'https://example.test/item', 'https://example.test/item', 'Saved item', 'A retained saved item.', ?2, 'published', ?2, ?3)",
+                    params![post_id, now, content_hash("Saved item\nA retained saved item.")],
+                )
+                .expect("post");
+            database
+                .set_saved(&format!("save-export-post-{index}"), &post_id, true)
+                .expect("save post");
+        }
+
+        assert_eq!(
+            database.saved_library().expect("display library").len(),
+            100
+        );
+        assert_eq!(
+            database
+                .saved_library_export()
+                .expect("portable export library")
+                .len(),
+            101,
+            "a person must be able to export every explicitly saved item, not only the visible page"
+        );
+    }
+
+    #[test]
+    fn since_last_edition_is_finite_and_counts_only_new_local_records() {
+        let mut database = Database::memory().expect("database");
+        seed_post(&mut database, "first-source", "first-post");
+        database.run_digest("first-edition").expect("first edition");
+
+        let first_dashboard = database
+            .dashboard(model(), host())
+            .expect("first dashboard");
+        assert_eq!(
+            first_dashboard.since_last_edition.detail,
+            "This is your first retained edition."
+        );
+        assert_eq!(first_dashboard.since_last_edition.new_items, 0);
+        assert_eq!(first_dashboard.since_last_edition.new_sources, 0);
+
+        let first_at: i64 = database
+            .connection
+            .query_row(
+                "SELECT generated_at FROM digests WHERE id=?1",
+                [&first_dashboard.edition.id],
+                |row| row.get(0),
+            )
+            .expect("first timestamp");
+        seed_post(&mut database, "second-source", "second-post");
+        database
+            .connection
+            .execute(
+                "UPDATE sources SET created_at=?1 WHERE id='second-source'",
+                [first_at + 1],
+            )
+            .expect("new source time");
+        database
+            .connection
+            .execute(
+                "UPDATE posts SET fetched_at=?1 WHERE id='second-post'",
+                [first_at + 2],
+            )
+            .expect("new post time");
+        database
+            .run_digest("second-edition")
+            .expect("second edition");
+
+        let second_dashboard = database
+            .dashboard(model(), host())
+            .expect("second dashboard");
+        assert_eq!(second_dashboard.since_last_edition.new_items, 1);
+        assert_eq!(second_dashboard.since_last_edition.new_sources, 1);
+        assert_eq!(
+            second_dashboard.since_last_edition.detail,
+            "Since your previous retained edition: 1 new local item from 1 new source."
+        );
     }
 
     /// Like `seed_post`, but places the source (created once per distinct
@@ -3777,7 +4554,7 @@ mod tests {
                 row.get(0)
             })
             .expect("schema version");
-        assert_eq!(version, 13);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let violations: i64 = database
             .connection
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -5133,7 +5910,7 @@ mod tests {
                 row.get(0)
             })
             .expect("version");
-        assert_eq!(version, 13);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let social_state: (String, i64, String, String) = database.connection.query_row(
             "SELECT status, truncated, evidence_hash, summary_input_hash FROM post_comment_state WHERE post_id='post-social-v9'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -5636,6 +6413,364 @@ mod tests {
     }
 
     #[test]
+    fn migration_15_replaces_legacy_comment_ids_with_source_scoped_fingerprints() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("legacy-comment-ledger.sqlite3");
+        let database = Database::open(&path).expect("latest database");
+        let now = Utc::now().timestamp_millis();
+        database
+            .connection
+            .execute(
+                "INSERT INTO sources(id, connector_kind, account_label, detail, status, config_json, created_at, updated_at, generation)
+                 VALUES('legacy-ledger-source', 'mastodon', 'Legacy', '', 'healthy', '{}', ?1, ?1, 1)",
+                [now],
+            )
+            .expect("source");
+        // Reconstruct the v12 durable table in an otherwise-current database, then rerun the
+        // v15-and-later transitions as a migration fixture.
+        database
+            .connection
+            .execute_batch(
+                "DROP TABLE comment_identity_ledger;
+                 CREATE TABLE comment_identity_ledger (
+                   source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                   remote_id TEXT NOT NULL,
+                   post_remote_id TEXT NOT NULL,
+                   first_seen_generation INTEGER NOT NULL CHECK (first_seen_generation > 0),
+                   PRIMARY KEY(source_id, remote_id)
+                 );
+                 INSERT INTO comment_identity_ledger(source_id, remote_id, post_remote_id, first_seen_generation)
+                 VALUES('legacy-ledger-source', 'comment-id-to-remove', 'post-id-to-remove', 1);
+                 DELETE FROM schema_migrations WHERE version IN (15, 16);",
+            )
+            .expect("v12 fixture");
+        drop(database);
+
+        let database = Database::open(&path).expect("migrate v15 and later");
+        let columns = {
+            let mut statement = database
+                .connection
+                .prepare("PRAGMA table_info(comment_identity_ledger)")
+                .expect("table info");
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("column rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("columns")
+        };
+        assert_eq!(
+            columns,
+            vec![
+                "source_id",
+                "comment_fingerprint",
+                "post_fingerprint",
+                "first_seen_generation"
+            ]
+        );
+        let fingerprints: (String, String) = database
+            .connection
+            .query_row(
+                "SELECT comment_fingerprint, post_fingerprint FROM comment_identity_ledger
+                 WHERE source_id='legacy-ledger-source'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("fingerprint row");
+        assert_eq!(
+            fingerprints,
+            (
+                comment_identity_fingerprint(
+                    "legacy-ledger-source",
+                    "comment",
+                    "comment-id-to-remove"
+                ),
+                comment_identity_fingerprint("legacy-ledger-source", "post", "post-id-to-remove")
+            )
+        );
+        let legacy_sql: String = database
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='comment_identity_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("ledger schema");
+        assert!(!legacy_sql.contains("remote_id"));
+        let version: i64 = database
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("version");
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn source_deletion_cascades_identity_ledger_so_a_recreated_source_can_assign_freshly() {
+        let mut database = Database::memory().expect("database");
+        let now = Utc::now().timestamp_millis();
+        let source = SourceSyncSpec {
+            id: "recreated-source".into(),
+            kind: SourceKind::Mastodon,
+            generation: 1,
+            config_json: "{}".into(),
+            cursor: None,
+        };
+        let comment = NormalizedComment {
+            post_remote_id: "old-post".into(),
+            remote_id: "provider-comment".into(),
+            parent_remote_id: None,
+            author: "Reader".into(),
+            body_text: "Old source evidence".into(),
+            published_at: now,
+            depth: 1,
+            position: 0,
+        };
+        let batch = SyncBatch {
+            posts: Vec::new(),
+            comments: vec![comment.clone()],
+            comment_scope_post_ids: vec!["old-post".into()],
+            cursor: None,
+            page_finality: PageFinality::Partial,
+            comment_completeness: CommentCompleteness::Partial,
+            comments_truncated: false,
+            health: crate::connectors::ConnectorHealth {
+                state: crate::connectors::ConnectorHealthState::Healthy,
+                safe_detail: "Test".into(),
+                retry_at: None,
+            },
+            rss: None,
+        };
+        database.connection.execute(
+            "INSERT INTO sources(id, connector_kind, account_label, detail, status, config_json, created_at, updated_at, generation)
+             VALUES(?1, 'mastodon', 'Before delete', '', 'healthy', '{}', ?2, ?2, 1)",
+            params![source.id, now],
+        ).expect("source");
+        let transaction = database.connection.transaction().expect("transaction");
+        insert_comment_identities(&transaction, &source, &batch).expect("identity");
+        transaction.commit().expect("commit");
+        database
+            .connection
+            .execute("DELETE FROM sources WHERE id=?1", [&source.id])
+            .expect("delete source");
+        let remaining: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM comment_identity_ledger", [], |row| {
+                row.get(0)
+            })
+            .expect("ledger count");
+        assert_eq!(remaining, 0);
+        database.connection.execute(
+            "INSERT INTO sources(id, connector_kind, account_label, detail, status, config_json, created_at, updated_at, generation)
+             VALUES(?1, 'mastodon', 'After delete', '', 'healthy', '{}', ?2, ?2, 1)",
+            params![source.id, now + 1],
+        ).expect("recreated source");
+        let reassigned = SyncBatch {
+            comments: vec![NormalizedComment {
+                post_remote_id: "new-post".into(),
+                ..comment
+            }],
+            comment_scope_post_ids: vec!["new-post".into()],
+            ..batch
+        };
+        assert_comment_id_assignments(&database.connection, &source.id, &reassigned)
+            .expect("new source can assign id");
+    }
+
+    #[test]
+    fn malformed_prepared_set_rolls_back_cursor_comments_summaries_jobs_and_privacy() {
+        let mut database = Database::memory().expect("database");
+        let now = Utc::now().timestamp_millis();
+        database.connection.execute(
+            "INSERT INTO sources(id, connector_kind, account_label, detail, status, config_json, sync_cursor, created_at, updated_at, generation)
+             VALUES('prepared-rollback', 'mastodon', 'Prepared', '', 'healthy', '{}', 'before', ?1, ?1, 1)", [now],
+        ).expect("source");
+        let source = SourceSyncSpec {
+            id: "prepared-rollback".into(),
+            kind: SourceKind::Mastodon,
+            generation: 1,
+            config_json: "{}".into(),
+            cursor: Some("before".into()),
+        };
+        let post_a = normalized("prepared-a", "A", "A body");
+        let post_b = normalized("prepared-b", "B", "B body");
+        let health = crate::connectors::ConnectorHealth {
+            state: crate::connectors::ConnectorHealthState::Healthy,
+            safe_detail: "Complete".into(),
+            retry_at: None,
+        };
+        let initial = SyncBatch {
+            posts: vec![post_a.clone(), post_b.clone()],
+            comments: Vec::new(),
+            comment_scope_post_ids: vec![post_a.remote_id.clone(), post_b.remote_id.clone()],
+            cursor: None,
+            page_finality: PageFinality::Complete,
+            comment_completeness: CommentCompleteness::Complete,
+            comments_truncated: false,
+            health: health.clone(),
+            rss: None,
+        };
+        let initial_prepared = prepared_from_candidates(
+            database
+                .changed_posts_for_sync_batch_fenced(&source, &initial, None)
+                .expect("initial candidates"),
+        );
+        database
+            .ingest_sync_batch_fenced(
+                &source,
+                "prepared-initial",
+                &initial,
+                initial_prepared,
+                None,
+            )
+            .expect("initial ingest");
+        let source = SourceSyncSpec {
+            cursor: None,
+            ..source
+        };
+        let comment = |post_remote_id: String, remote_id: &str| NormalizedComment {
+            post_remote_id,
+            remote_id: remote_id.into(),
+            parent_remote_id: None,
+            author: "Reader".into(),
+            body_text: "Changed discussion".into(),
+            published_at: now + 1,
+            depth: 1,
+            position: 0,
+        };
+        let changed = SyncBatch {
+            posts: Vec::new(),
+            comments: vec![
+                comment(post_a.remote_id.clone(), "comment-a"),
+                comment(post_b.remote_id.clone(), "comment-b"),
+            ],
+            comment_scope_post_ids: vec![post_a.remote_id.clone(), post_b.remote_id.clone()],
+            cursor: Some("after".into()),
+            page_finality: PageFinality::Partial,
+            comment_completeness: CommentCompleteness::Partial,
+            comments_truncated: false,
+            health,
+            rss: None,
+        };
+        let valid = prepared_from_candidates(
+            database
+                .changed_posts_for_sync_batch_fenced(&source, &changed, None)
+                .expect("changed candidates"),
+        );
+        assert_eq!(valid.len(), 2);
+        let malformed = vec![valid[0].clone(), valid[0].clone()];
+        let before: (Option<String>, i64, i64, i64, i64) = database.connection.query_row(
+            "SELECT s.sync_cursor, (SELECT COUNT(*) FROM comments), (SELECT COUNT(*) FROM summaries), (SELECT COUNT(*) FROM jobs), (SELECT privacy_epoch FROM app_state WHERE singleton=1) FROM sources s WHERE s.id='prepared-rollback'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).expect("before");
+        assert!(
+            database
+                .ingest_sync_batch_fenced(&source, "prepared-malformed", &changed, malformed, None)
+                .is_err()
+        );
+        let after: (Option<String>, i64, i64, i64, i64) = database.connection.query_row(
+            "SELECT s.sync_cursor, (SELECT COUNT(*) FROM comments), (SELECT COUNT(*) FROM summaries), (SELECT COUNT(*) FROM jobs), (SELECT privacy_epoch FROM app_state WHERE singleton=1) FROM sources s WHERE s.id='prepared-rollback'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).expect("after");
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn reversed_complete_comment_snapshot_is_stable_after_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("reversed-comments.sqlite3");
+        let mut database = Database::open(&path).expect("database");
+        let now = Utc::now().timestamp_millis();
+        database.connection.execute(
+            "INSERT INTO sources(id, connector_kind, account_label, detail, status, config_json, created_at, updated_at, generation)
+             VALUES('reversed-comments', 'mastodon', 'Reversed', '', 'healthy', '{}', ?1, ?1, 1)", [now],
+        ).expect("source");
+        let source = SourceSyncSpec {
+            id: "reversed-comments".into(),
+            kind: SourceKind::Mastodon,
+            generation: 1,
+            config_json: "{}".into(),
+            cursor: None,
+        };
+        let post = normalized("reversed-post", "Post", "Post evidence");
+        let comment = |id: &str, position: u32| NormalizedComment {
+            post_remote_id: post.remote_id.clone(),
+            remote_id: id.into(),
+            parent_remote_id: None,
+            author: "Reader".into(),
+            body_text: format!("{id} evidence"),
+            published_at: now + i64::from(position),
+            depth: 1,
+            position,
+        };
+        let health = crate::connectors::ConnectorHealth {
+            state: crate::connectors::ConnectorHealthState::Healthy,
+            safe_detail: "Complete".into(),
+            retry_at: None,
+        };
+        let first = comment("first", 1);
+        let second = comment("second", 2);
+        let initial = SyncBatch {
+            posts: vec![post.clone()],
+            comments: vec![second.clone(), first.clone()],
+            comment_scope_post_ids: vec![post.remote_id.clone()],
+            cursor: Some("cursor-one".into()),
+            page_finality: PageFinality::Complete,
+            comment_completeness: CommentCompleteness::Complete,
+            comments_truncated: false,
+            health: health.clone(),
+            rss: None,
+        };
+        let prepared = prepared_from_candidates(
+            database
+                .changed_posts_for_sync_batch_fenced(&source, &initial, None)
+                .expect("initial candidates"),
+        );
+        database
+            .ingest_sync_batch_fenced(&source, "reversed-initial", &initial, prepared, None)
+            .expect("initial ingest");
+        let before: String = database.connection.query_row(
+            "SELECT summary_input_hash FROM post_comment_state pcs JOIN posts p ON p.id=pcs.post_id WHERE p.source_id='reversed-comments'", [], |row| row.get(0),
+        ).expect("input hash");
+        drop(database);
+
+        let mut database = Database::open(&path).expect("reopen");
+        let source = SourceSyncSpec {
+            cursor: Some("cursor-one".into()),
+            ..source
+        };
+        let reversed = SyncBatch {
+            posts: Vec::new(),
+            comments: vec![first, second],
+            comment_scope_post_ids: vec![post.remote_id.clone()],
+            cursor: Some("cursor-two".into()),
+            page_finality: PageFinality::Complete,
+            comment_completeness: CommentCompleteness::Complete,
+            comments_truncated: false,
+            health,
+            rss: None,
+        };
+        assert!(
+            database
+                .changed_posts_for_sync_batch_fenced(&source, &reversed, None)
+                .expect("reversed candidates")
+                .is_empty()
+        );
+        database
+            .ingest_sync_batch_fenced(&source, "reversed-repeat", &reversed, Vec::new(), None)
+            .expect("stable repeat");
+        let after: String = database.connection.query_row(
+            "SELECT summary_input_hash FROM post_comment_state pcs JOIN posts p ON p.id=pcs.post_id WHERE p.source_id='reversed-comments'", [], |row| row.get(0),
+        ).expect("stable state");
+        let identities: Vec<String> = database.connection.prepare(
+            "SELECT remote_id FROM comments WHERE source_id='reversed-comments' ORDER BY position, published_at, remote_id"
+        ).expect("identity statement").query_map([], |row| row.get(0)).expect("identity rows")
+          .collect::<Result<_, _>>().expect("identities");
+        assert_eq!(after, before);
+        assert_eq!(identities, vec!["first", "second"]);
+    }
+
+    #[test]
     fn comment_snapshot_finality_reconciles_provenance_and_retention_privacy() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("comment-finality.sqlite3");
@@ -5647,6 +6782,7 @@ mod tests {
             [now],
         ).expect("source");
         let post = normalized("post-finality", "Post", "Post evidence.");
+        let post_b = normalized("post-finality-b", "Post B", "Post B evidence.");
         let make_comment = |id: &str, body: &str, position: u32| NormalizedComment {
             post_remote_id: post.remote_id.clone(),
             remote_id: id.into(),
@@ -5684,12 +6820,12 @@ mod tests {
         };
 
         let initial = SyncBatch {
-            posts: vec![post.clone()],
+            posts: vec![post.clone(), post_b.clone()],
             comments: vec![
                 make_comment("one", "First", 1),
                 make_comment("two", "Second", 2),
             ],
-            comment_scope_post_ids: vec![post.remote_id.clone()],
+            comment_scope_post_ids: vec![post.remote_id.clone(), post_b.remote_id.clone()],
             cursor: Some("cursor-1".into()),
             page_finality: PageFinality::Complete,
             comment_completeness: CommentCompleteness::Complete,
@@ -5706,8 +6842,8 @@ mod tests {
             .expect("classify initial");
         assert_eq!(
             changed.len(),
-            1,
-            "one changed post consumes one attempt slot"
+            2,
+            "each new post consumes one bounded attempt slot"
         );
         database
             .ingest_sync_batch_fenced(
@@ -5830,12 +6966,12 @@ mod tests {
         let mut database = Database::open(&path).expect("reopen");
         let (input_hash, provenance): (String, String) = database.connection.query_row(
             "SELECT s.input_hash, s.provenance_json FROM summaries s JOIN posts p ON p.id=s.post_id
-             WHERE p.source_id='mastodon-finality'",
+             WHERE p.source_id='mastodon-finality' AND p.remote_id='post-finality'",
             [], |row| Ok((row.get(0)?, row.get(1)?)),
         ).expect("summary provenance");
         let expected_hash: String = database.connection.query_row(
             "SELECT summary_input_hash FROM post_comment_state pcs JOIN posts p ON p.id=pcs.post_id
-             WHERE p.source_id='mastodon-finality'",
+             WHERE p.source_id='mastodon-finality' AND p.remote_id='post-finality'",
             [], |row| row.get(0),
         ).expect("expected hash");
         assert_eq!(input_hash, expected_hash);
@@ -5858,10 +6994,15 @@ mod tests {
             )
             .expect("epoch");
         database.apply_retention().expect("retention");
-        let summary_count: i64 = database.connection.query_row(
-            "SELECT COUNT(*) FROM summaries s JOIN posts p ON p.id=s.post_id WHERE p.source_id='mastodon-finality'",
-            [], |row| row.get(0),
-        ).expect("summary count");
+        let summary_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM summaries s JOIN posts p ON p.id=s.post_id
+             WHERE p.source_id='mastodon-finality' AND p.remote_id='post-finality'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("summary count");
         assert_eq!(summary_count, 0, "retention removes stale derived overview");
         let epoch_after_retention: i64 = database
             .connection
@@ -5874,10 +7015,40 @@ mod tests {
         assert_eq!(epoch_after_retention, epoch_before_retention + 1);
         let retained_state: (String, i64) = database.connection.query_row(
             "SELECT pcs.status, pcs.truncated FROM post_comment_state pcs JOIN posts p ON p.id=pcs.post_id
-             WHERE p.source_id='mastodon-finality'",
+             WHERE p.source_id='mastodon-finality' AND p.remote_id='post-finality'",
             [], |row| Ok((row.get(0)?, row.get(1)?)),
         ).expect("retained state");
         assert_eq!(retained_state, ("partial".into(), 1));
+        let retained_identity_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM comment_identity_ledger WHERE source_id='mastodon-finality'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("retained identity");
+        assert_eq!(retained_identity_count, 2);
+        source.cursor = None;
+        let reassigned_after_retention = SyncBatch {
+            posts: Vec::new(),
+            comments: vec![NormalizedComment {
+                post_remote_id: post_b.remote_id.clone(),
+                ..make_comment("one", "Attempted reassignment", 1)
+            }],
+            comment_scope_post_ids: vec![post_b.remote_id.clone()],
+            cursor: None,
+            page_finality: PageFinality::Partial,
+            comment_completeness: CommentCompleteness::Partial,
+            comments_truncated: false,
+            health: initial.health.clone(),
+            rss: None,
+        };
+        assert!(
+            database
+                .changed_posts_for_sync_batch_fenced(&source, &reassigned_after_retention, None)
+                .is_err(),
+            "retention must not let a provider comment id move to another retained post"
+        );
     }
 
     #[test]

@@ -21,11 +21,14 @@ use std::time::Duration;
 
 use chrono::{Local, Utc};
 use connectors::{
-    Connector, ConnectorError, ConnectorSyncRequest, ConnectorTransport, RssConnector, SourceKind,
-    SourceSyncSpec, SyncPage, SyncRequest,
+    Connector, ConnectorError, ConnectorSyncRequest, ConnectorTransport, MastodonConnector,
+    MastodonLoopbackCallback, RssConnector, SecretValue, SourceKind, SourceSyncSpec, SyncPage,
+    SyncRequest, exchange_mastodon_authorization_code,
     export_import::{
         ImportError, ImportPlatform, MAX_IMPORT_FILE_BYTES, MAX_IMPORT_ITEMS, parse_export_file,
     },
+    mastodon_authorization_url, mastodon_registration_request, new_mastodon_pkce,
+    probe_mastodon_instance as probe_mastodon_oauth_metadata, register_mastodon_client,
     validate_sync_request,
 };
 use db::{
@@ -33,17 +36,24 @@ use db::{
     SourceSelectionMode, content_hash, validate_id, validate_source_label,
 };
 use domain::{
-    AddRssSourceRequest, AppError, AppResult, Dashboard, DeleteSourceRequest, FeedbackRequest,
-    ImportArchiveRequest, ImportArchiveResult, ImportArchiveStatus, ModelState,
-    OpenOriginalRequest, ResetLearningRequest, RunDigestRequest, SyncSourcesRequest,
-    SyncSourcesResult, UndoFeedbackRequest, UpdateSettingsRequest,
+    AddRssSourceRequest, AppError, AppResult, ConnectMastodonRequest, Dashboard,
+    DeleteSourceRequest, DiscoverFeedsRequest, FeedbackRequest, ImportArchiveRequest,
+    ImportArchiveResult, ImportArchiveStatus, MastodonProbeResult, ModelState, OpenOriginalRequest,
+    OpmlCandidate, ProbeMastodonInstanceRequest, RenameSourceRequest, ResetLearningRequest,
+    RestoreBackupRequest, RunDigestRequest, SearchLibraryRequest, SetSavedRequest,
+    SetSourcePausedRequest, SyncSourceRequest, SyncSourcesRequest, SyncSourcesResult,
+    UndoFeedbackRequest, UpdateSettingsRequest,
 };
 use inference::{
     DeterministicFallback, InferenceProvider, OllamaProvider, PROMPT_VERSION, SummaryRequest,
     fallback_status,
 };
 use secrets::{OsSecretStore, SecretStore};
-use tauri::{AppHandle, Manager, State};
+use tauri::{
+    AppHandle, Manager, State, WindowEvent,
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use url::Url;
@@ -74,6 +84,8 @@ const _: () = assert!(
 const MAX_SOURCES_PER_RUN: usize = 20;
 const RUNNER_LEASE_MS: i64 = 10 * 60 * 1_000;
 const RUNNER_DEADLINE: Duration = Duration::from_secs(8 * 60);
+const MAX_OPML_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_OPML_CANDIDATES: usize = 500;
 
 async fn bounded_deadline<F: std::future::Future>(
     duration: Duration,
@@ -132,6 +144,7 @@ fn admit_local_command(disposition: RequestDisposition) -> AppResult<ExternalCom
 
 pub struct AppState {
     database: Mutex<Database>,
+    database_path: PathBuf,
     model: tokio::sync::Mutex<Option<OllamaProvider>>,
     sync_gate: tokio::sync::Mutex<()>,
     runner_active: AtomicBool,
@@ -141,13 +154,29 @@ pub struct AppState {
 
 impl AppState {
     fn new(database_path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let database = Database::open(&database_path)?;
+        let secrets = OsSecretStore;
+        // A credential provider can fail after accepting a write. These rows contain only the
+        // opaque credential reference, never a token; retrying deletion is safe and makes a
+        // interrupted connection recoverable on every supported desktop platform.
+        let pending_cleanups = database
+            .pending_vault_cleanups()
+            .map_err(|_| std::io::Error::other("could not read pending vault cleanup records"))?;
+        for (request_id, secret_ref) in pending_cleanups {
+            if secrets.delete(&secret_ref).is_ok() {
+                database
+                    .clear_pending_vault_cleanup(&request_id)
+                    .map_err(|_| std::io::Error::other("could not clear pending vault cleanup"))?;
+            }
+        }
         Ok(Self {
-            database: Mutex::new(Database::open(&database_path)?),
+            database: Mutex::new(database),
+            database_path,
             model: tokio::sync::Mutex::new(None),
             sync_gate: tokio::sync::Mutex::new(()),
             runner_active: AtomicBool::new(false),
             in_flight: AtomicBool::new(false),
-            secrets: OsSecretStore,
+            secrets,
         })
     }
 
@@ -174,6 +203,12 @@ impl AppState {
                 "The selected model name is invalid; deterministic fallback remains active.",
             ),
         }
+    }
+
+    async fn installed_models(&self) -> Vec<String> {
+        OllamaProvider::installed_models(OLLAMA_ENDPOINT)
+            .await
+            .unwrap_or_default()
     }
 
     async fn dashboard(&self) -> AppResult<Dashboard> {
@@ -350,6 +385,57 @@ impl AppState {
         })
     }
 
+    async fn sync_mastodon_one(
+        &self,
+        source: &SourceSyncSpec,
+        request_id: &str,
+        selected_model: &str,
+        model_item_budget: usize,
+        lease: Option<&db::RunnerLease>,
+    ) -> Result<SourceSyncResult, ConnectorError> {
+        if source.kind != SourceKind::Mastodon {
+            return Err(ConnectorError::InvalidFeed);
+        }
+        let secret_ref = self
+            .database()
+            .map_err(|_| ConnectorError::Transient)?
+            .secret_ref_for_source(&source.id)
+            .map_err(|_| ConnectorError::Transient)?
+            .ok_or(ConnectorError::AuthRequired)?;
+        let access_token = self
+            .secrets
+            .get(&secret_ref)
+            .map_err(|_| ConnectorError::Transient)?;
+        let access_token = SecretValue::new(access_token)?;
+        let connector = MastodonConnector::new()?;
+        let batch = connector
+            .sync(&ConnectorSyncRequest {
+                source: source.clone(),
+                auth: Some(connectors::ConnectorAuth { access_token }),
+                transport: ConnectorTransport::OfficialApi,
+            })
+            .await?;
+        let candidates = self
+            .database()
+            .map_err(|_| ConnectorError::Transient)?
+            .changed_posts_for_sync_batch_fenced(source, &batch, lease)
+            .map_err(|_| ConnectorError::Transient)?;
+        let (prepared, attempted_model_items) = self
+            .prepare_posts(&candidates, selected_model, model_item_budget)
+            .await
+            .map_err(|_| ConnectorError::Transient)?;
+        let (changed_items, _) = self
+            .database()
+            .map_err(|_| ConnectorError::Transient)?
+            .ingest_sync_batch_fenced(source, request_id, &batch, prepared, lease)
+            .map_err(|_| ConnectorError::Transient)?;
+        Ok(SourceSyncResult {
+            attempted_model_items,
+            changed_items,
+            changed: changed_items > 0,
+        })
+    }
+
     async fn sync_and_prepare(
         &self,
         mode: SourceSelectionMode,
@@ -389,7 +475,7 @@ impl AppState {
         let now = Utc::now().timestamp_millis();
         let (sources, source_limit_reached, settings) = {
             let database = self.database()?;
-            let (sources, capped) = database.rss_sources(mode, now, MAX_SOURCES_PER_RUN)?;
+            let (sources, capped) = database.source_sync_specs(mode, now, MAX_SOURCES_PER_RUN)?;
             (sources, capped, database.settings()?)
         };
         let mut outcome = domain::SyncOutcome {
@@ -415,16 +501,31 @@ impl AppState {
                 )?);
             }
             let child_request = format!("{request_id}:{index}");
-            match self
-                .sync_one(
-                    source,
-                    &child_request,
-                    &settings.selected_model,
-                    model_item_budget,
-                    lease.as_ref(),
-                )
-                .await
-            {
+            let result = match source.kind {
+                SourceKind::Rss => {
+                    let rss_source = self.database()?.rss_source(&source.id)?;
+                    self.sync_one(
+                        &rss_source,
+                        &child_request,
+                        &settings.selected_model,
+                        model_item_budget,
+                        lease.as_ref(),
+                    )
+                    .await
+                }
+                SourceKind::Mastodon => {
+                    self.sync_mastodon_one(
+                        source,
+                        &child_request,
+                        &settings.selected_model,
+                        model_item_budget,
+                        lease.as_ref(),
+                    )
+                    .await
+                }
+                SourceKind::Bluesky => Err(ConnectorError::AuthRequired),
+            };
+            match result {
                 Ok(result) => {
                     model_item_budget =
                         model_item_budget.saturating_sub(result.attempted_model_items);
@@ -453,12 +554,15 @@ impl AppState {
                             "RSS source could not be reached within the bounded request"
                         }
                     };
-                    let _ = self.database()?.record_sync_failure_fenced(
-                        source,
-                        &child_request,
-                        message,
-                        lease.as_ref(),
-                    );
+                    if source.kind == SourceKind::Rss {
+                        let rss_source = self.database()?.rss_source(&source.id)?;
+                        let _ = self.database()?.record_sync_failure_fenced(
+                            &rss_source,
+                            &child_request,
+                            message,
+                            lease.as_ref(),
+                        );
+                    }
                 }
             }
         }
@@ -480,6 +584,65 @@ impl AppState {
             self.database()?.complete_request(request_id)?;
         }
         Ok(outcome)
+    }
+
+    async fn sync_source_and_prepare(&self, request_id: &str, source_id: &str) -> AppResult<()> {
+        validate_id(request_id)?;
+        validate_id(source_id)?;
+        let _guard = self
+            .sync_gate
+            .try_lock()
+            .map_err(|_| AppError::conflict("A source sync or deletion is already running."))?;
+        if admit_external_command(self.database()?.begin_request(
+            request_id,
+            "sync_source",
+            &content_hash(source_id),
+        )?)? == ExternalCommandAdmission::ReplayComplete
+        {
+            return Ok(());
+        }
+        let (source, selected_model) = {
+            let database = self.database()?;
+            (
+                database.connector_source(source_id)?,
+                database.settings()?.selected_model,
+            )
+        };
+        let result = match source.kind {
+            SourceKind::Rss => {
+                let source = self.database()?.rss_source(source_id)?;
+                self.sync_one(
+                    &source,
+                    request_id,
+                    &selected_model,
+                    MAX_MODEL_ITEMS_PER_BATCH,
+                    None,
+                )
+                .await
+            }
+            SourceKind::Mastodon => {
+                self.sync_mastodon_one(
+                    &source,
+                    request_id,
+                    &selected_model,
+                    MAX_MODEL_ITEMS_PER_BATCH,
+                    None,
+                )
+                .await
+            }
+            SourceKind::Bluesky => Err(ConnectorError::AuthRequired),
+        };
+        match result {
+            Ok(_) => {
+                self.database()?.run_digest(request_id)?;
+                self.database()?.complete_request(request_id)?;
+                Ok(())
+            }
+            Err(error) => {
+                self.database()?.abort_request(request_id);
+                Err(map_connector_error(error))
+            }
+        }
     }
 
     async fn resident_tick(&self) -> AppResult<()> {
@@ -658,6 +821,229 @@ async fn pick_archive_file(
     }
 }
 
+async fn pick_opml_file(app: &AppHandle) -> AppResult<Option<PathBuf>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose an OPML feed list")
+        .add_filter("OPML feed list", &["opml", "xml"])
+        .pick_file(move |selection| {
+            let _ = sender.send(selection);
+        });
+    match receiver.await.map_err(|_| AppError::internal())? {
+        Some(file) => file
+            .into_path()
+            .map(Some)
+            .map_err(|_| AppError::validation("The selected OPML file is not a local file.")),
+        None => Ok(None),
+    }
+}
+
+async fn pick_opml_save_path(app: &AppHandle) -> AppResult<Option<PathBuf>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Export Web RSS subscriptions")
+        .set_file_name("web-rss-sources.opml")
+        .add_filter("OPML feed list", &["opml"])
+        .save_file(move |selection| {
+            let _ = sender.send(selection);
+        });
+    match receiver.await.map_err(|_| AppError::internal())? {
+        Some(file) => file
+            .into_path()
+            .map(Some)
+            .map_err(|_| AppError::validation("The chosen OPML location is not a local file.")),
+        None => Ok(None),
+    }
+}
+
+async fn pick_backup_save_path(app: &AppHandle) -> AppResult<Option<PathBuf>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Save a local Web backup")
+        .set_file_name("web-backup.sqlite3")
+        .add_filter("Web SQLite backup", &["sqlite3"])
+        .save_file(move |selection| {
+            let _ = sender.send(selection);
+        });
+    match receiver.await.map_err(|_| AppError::internal())? {
+        Some(file) => file
+            .into_path()
+            .map(Some)
+            .map_err(|_| AppError::validation("The chosen backup location is not a local file.")),
+        None => Ok(None),
+    }
+}
+
+async fn pick_saved_items_export_path(app: &AppHandle) -> AppResult<Option<PathBuf>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Export saved Web items")
+        .set_file_name("web-saved-items.json")
+        .add_filter("Web saved items", &["json"])
+        .save_file(move |selection| {
+            let _ = sender.send(selection);
+        });
+    match receiver.await.map_err(|_| AppError::internal())? {
+        Some(file) => file
+            .into_path()
+            .map(Some)
+            .map_err(|_| AppError::validation("The chosen export location is not a local file.")),
+        None => Ok(None),
+    }
+}
+
+async fn pick_backup_restore_path(app: &AppHandle) -> AppResult<Option<PathBuf>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose a Web SQLite backup")
+        .add_filter("Web SQLite backup", &["sqlite3", "db"])
+        .pick_file(move |selection| {
+            let _ = sender.send(selection);
+        });
+    match receiver.await.map_err(|_| AppError::internal())? {
+        Some(file) => file
+            .into_path()
+            .map(Some)
+            .map_err(|_| AppError::validation("The selected backup is not a local file.")),
+        None => Ok(None),
+    }
+}
+
+fn read_opml_file_bounded(path: &Path) -> AppResult<Vec<u8>> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|_| AppError::validation("That OPML file could not be read."))?;
+    if !metadata.is_file() || metadata.len() > MAX_OPML_FILE_BYTES {
+        return Err(AppError::validation(
+            "Choose a local OPML file up to 1 MiB.",
+        ));
+    }
+    let mut reader = File::open(path)
+        .map_err(|_| AppError::validation("That OPML file could not be read."))?
+        .take(MAX_OPML_FILE_BYTES + 1);
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::validation("That OPML file could not be read."))?;
+    if bytes.len() > usize::try_from(MAX_OPML_FILE_BYTES).unwrap_or(usize::MAX) {
+        return Err(AppError::validation(
+            "Choose a local OPML file up to 1 MiB.",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn attribute_value(tag: &str, attribute: &str) -> Option<String> {
+    for quote in ['\"', '\''] {
+        let needle = format!("{attribute}={quote}");
+        if let Some(start) = tag.find(&needle) {
+            let tail = &tag[start + needle.len()..];
+            if let Some(end) = tail.find(quote) {
+                return Some(
+                    tail[..end]
+                        .replace("&quot;", "\"")
+                        .replace("&apos;", "'")
+                        .replace("&lt;", "<")
+                        .replace("&gt;", ">")
+                        .replace("&amp;", "&"),
+                );
+            }
+        }
+    }
+    None
+}
+
+fn parse_opml(bytes: &[u8]) -> AppResult<Vec<OpmlCandidate>> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| AppError::validation("That OPML file is not valid UTF-8."))?;
+    if !text.to_ascii_lowercase().contains("<opml") {
+        return Err(AppError::validation("That file is not an OPML feed list."));
+    }
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for fragment in text
+        .split('<')
+        .filter(|fragment| fragment.trim_start().starts_with("outline"))
+    {
+        let tag = fragment.split('>').next().unwrap_or_default();
+        let Some(url) = attribute_value(tag, "xmlUrl").or_else(|| attribute_value(tag, "xmlurl"))
+        else {
+            continue;
+        };
+        let Ok(parsed) = Url::parse(&url) else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host().is_none()
+            || !seen.insert(url.clone())
+        {
+            continue;
+        }
+        let label = attribute_value(tag, "title")
+            .or_else(|| attribute_value(tag, "text"))
+            .unwrap_or_else(|| parsed.host_str().unwrap_or("Feed").to_owned());
+        candidates.push(OpmlCandidate {
+            label: label.chars().take(100).collect(),
+            url,
+        });
+        if candidates.len() > MAX_OPML_CANDIDATES {
+            return Err(AppError::validation(
+                "This OPML list has more than 500 feeds. Split it into smaller lists.",
+            ));
+        }
+    }
+    if candidates.is_empty() {
+        return Err(AppError::validation(
+            "No public RSS or Atom URLs were found in that OPML file.",
+        ));
+    }
+    Ok(candidates)
+}
+
+fn escape_opml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&apos;")
+}
+
+fn render_opml_export(sources: &[(String, String)]) -> AppResult<Vec<u8>> {
+    if sources.is_empty() {
+        return Err(AppError::validation(
+            "Add an RSS source before exporting an OPML list.",
+        ));
+    }
+    if sources.len() > MAX_OPML_CANDIDATES {
+        return Err(AppError::validation(
+            "This library has more than 500 RSS sources. Export smaller groups first.",
+        ));
+    }
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"2.0\">\n  <head><title>Web RSS subscriptions</title></head>\n  <body>\n",
+    );
+    for (label, url) in sources {
+        xml.push_str(&format!(
+            "    <outline text=\"{}\" title=\"{}\" type=\"rss\" xmlUrl=\"{}\" />\n",
+            escape_opml_attribute(label),
+            escape_opml_attribute(label),
+            escape_opml_attribute(url)
+        ));
+    }
+    xml.push_str("  </body>\n</opml>\n");
+    if xml.len() > usize::try_from(MAX_OPML_FILE_BYTES).unwrap_or(usize::MAX) {
+        return Err(AppError::validation(
+            "The OPML export would exceed 1 MiB. Export smaller source groups first.",
+        ));
+    }
+    Ok(xml.into_bytes())
+}
+
 async fn import_archive_with_loader<F, Fut>(
     state: &AppState,
     request: &ImportArchiveRequest,
@@ -817,6 +1203,19 @@ async fn get_dashboard(state: State<'_, AppState>) -> AppResult<Dashboard> {
 }
 
 #[tauri::command]
+async fn get_edition(
+    state: State<'_, AppState>,
+    edition_id: String,
+) -> AppResult<domain::EditionDetail> {
+    state.database()?.edition_detail(&edition_id)
+}
+
+#[tauri::command]
+async fn installed_models(state: State<'_, AppState>) -> AppResult<Vec<String>> {
+    Ok(state.installed_models().await)
+}
+
+#[tauri::command]
 async fn run_digest(state: State<'_, AppState>, request: RunDigestRequest) -> AppResult<Dashboard> {
     state.database()?.run_digest(&request.request_id)?;
     state.dashboard().await
@@ -851,6 +1250,17 @@ async fn sync_sources(
         dashboard: state.dashboard().await?,
         outcome,
     })
+}
+
+#[tauri::command]
+async fn sync_source(
+    state: State<'_, AppState>,
+    request: SyncSourceRequest,
+) -> AppResult<Dashboard> {
+    state
+        .sync_source_and_prepare(&request.request_id, &request.source_id)
+        .await?;
+    state.dashboard().await
 }
 
 #[tauri::command]
@@ -1096,6 +1506,555 @@ async fn reset_learning(
     state.dashboard().await
 }
 
+#[tauri::command]
+async fn search_library(
+    state: State<'_, AppState>,
+    request: SearchLibraryRequest,
+) -> AppResult<Vec<domain::LibraryItem>> {
+    state.database()?.search_library(&request.query)
+}
+
+#[tauri::command]
+async fn saved_library(state: State<'_, AppState>) -> AppResult<Vec<domain::LibraryItem>> {
+    state.database()?.saved_library()
+}
+
+#[tauri::command]
+async fn set_saved(state: State<'_, AppState>, request: SetSavedRequest) -> AppResult<Dashboard> {
+    let payload = format!("{}:{}", request.post_id, request.saved);
+    {
+        let mut database = state.database()?;
+        if admit_local_command(database.begin_request(
+            &request.request_id,
+            "set_saved",
+            &content_hash(&payload),
+        )?)? == ExternalCommandAdmission::Execute
+        {
+            if let Err(error) =
+                database.set_saved(&request.request_id, &request.post_id, request.saved)
+            {
+                database.abort_request(&request.request_id);
+                return Err(error);
+            }
+            database.complete_request(&request.request_id)?;
+        }
+    }
+    state.dashboard().await
+}
+
+#[tauri::command]
+async fn rename_source(
+    state: State<'_, AppState>,
+    request: RenameSourceRequest,
+) -> AppResult<Dashboard> {
+    let payload = format!("{}:{}", request.source_id, request.label.trim());
+    {
+        let mut database = state.database()?;
+        if admit_local_command(database.begin_request(
+            &request.request_id,
+            "rename_source",
+            &content_hash(&payload),
+        )?)? == ExternalCommandAdmission::Execute
+        {
+            if let Err(error) = database.rename_source(&request.source_id, &request.label) {
+                database.abort_request(&request.request_id);
+                return Err(error);
+            }
+            database.complete_request(&request.request_id)?;
+        }
+    }
+    state.dashboard().await
+}
+
+#[tauri::command]
+async fn set_source_paused(
+    state: State<'_, AppState>,
+    request: SetSourcePausedRequest,
+) -> AppResult<Dashboard> {
+    let payload = format!("{}:{}", request.source_id, request.paused);
+    {
+        let mut database = state.database()?;
+        if admit_local_command(database.begin_request(
+            &request.request_id,
+            "set_source_paused",
+            &content_hash(&payload),
+        )?)? == ExternalCommandAdmission::Execute
+        {
+            if let Err(error) = database.set_source_paused(&request.source_id, request.paused) {
+                database.abort_request(&request.request_id);
+                return Err(error);
+            }
+            database.complete_request(&request.request_id)?;
+        }
+    }
+    state.dashboard().await
+}
+
+#[tauri::command]
+async fn pick_opml(app: AppHandle) -> AppResult<Vec<OpmlCandidate>> {
+    let Some(path) = pick_opml_file(&app).await? else {
+        return Ok(Vec::new());
+    };
+    let bytes = tokio::task::spawn_blocking(move || read_opml_file_bounded(&path))
+        .await
+        .map_err(|_| AppError::internal())??;
+    parse_opml(&bytes)
+}
+
+#[tauri::command]
+async fn discover_feeds(request: DiscoverFeedsRequest) -> AppResult<Vec<OpmlCandidate>> {
+    let connector = RssConnector::new().map_err(map_connector_error)?;
+    connector
+        .discover_feeds(&request.url)
+        .await
+        .map(|feeds| {
+            feeds
+                .into_iter()
+                .map(|(label, url)| OpmlCandidate { label, url })
+                .collect()
+        })
+        .map_err(map_connector_error)
+}
+
+fn map_mastodon_probe_error(error: ConnectorError) -> AppError {
+    match error {
+        ConnectorError::UnsafeUrl => AppError::validation(
+            "Use a public HTTPS Mastodon instance root, without a path, query, or credentials.",
+        ),
+        ConnectorError::ResponseTooLarge => AppError::validation(
+            "That instance's OAuth metadata exceeds Web's 64 KiB safety limit.",
+        ),
+        ConnectorError::InvalidFeed => AppError::validation(
+            "That instance did not provide compatible OAuth authorization-server metadata.",
+        ),
+        ConnectorError::AuthRequired => AppError::validation(
+            "That instance does not advertise authorization-code PKCE S256 with the minimum read scopes.",
+        ),
+        ConnectorError::RateLimited => AppError::conflict(
+            "That instance rate-limited the compatibility check. No account was connected; try again later.",
+        ),
+        ConnectorError::Transient => AppError::unavailable(
+            "The instance could not be safely checked. No account was connected or stored.",
+        ),
+    }
+}
+
+#[tauri::command]
+async fn probe_mastodon_instance(
+    request: ProbeMastodonInstanceRequest,
+) -> AppResult<MastodonProbeResult> {
+    let endpoints = probe_mastodon_oauth_metadata(&request.instance_url)
+        .await
+        .map_err(map_mastodon_probe_error)?;
+    Ok(MastodonProbeResult {
+        instance_url: endpoints.instance.to_string(),
+        supported_scopes: endpoints.scopes.into_iter().collect(),
+        connection_enabled: false,
+    })
+}
+
+fn abort_mastodon_connection(database: &Database, request_id: &str) {
+    // Deleting the pending receipt cascades the non-secret cleanup reference. This is safe only
+    // before a vault write has reported an indeterminate outcome.
+    database.abort_request(request_id);
+}
+
+fn persist_mastodon_access_token<S: SecretStore>(
+    database: &mut Database,
+    secrets: &S,
+    request: &ConnectMastodonRequest,
+    source_id: &str,
+    secret_ref: &str,
+    access_token: &str,
+) -> AppResult<()> {
+    if secrets.put(secret_ref, access_token).is_err() {
+        // A secure-store failure does not prove that no write occurred. Preserve its cleanup
+        // reference and fail closed rather than allowing this request to replay.
+        database.seal_request_unknown(&request.request_id, "connect_mastodon")?;
+        return Err(AppError::new_secure_store_failure());
+    }
+    if let Err(error) = database.add_mastodon_source(
+        &request.request_id,
+        source_id,
+        &request.label,
+        &request.instance_url,
+        secret_ref,
+    ) {
+        if secrets.delete(secret_ref).is_ok() {
+            abort_mastodon_connection(database, &request.request_id);
+            return Err(error);
+        }
+        database.seal_request_unknown(&request.request_id, "connect_mastodon")?;
+        return Err(AppError::new_secure_store_failure());
+    }
+    Ok(())
+}
+
+/// The native connection orchestration is deliberately not registered in the invoke handler.
+/// It is complete enough to make vault/database failure boundaries testable, but must stay out of
+/// the renderer until the bounded read-only timeline connector can activate and remove sources
+/// without exposing an authorization that cannot yet be consumed.
+async fn connect_mastodon_natively<F>(
+    state: &AppState,
+    request: ConnectMastodonRequest,
+    open_authorization: F,
+) -> AppResult<()>
+where
+    F: FnOnce(&Url) -> AppResult<()>,
+{
+    validate_id(&request.request_id)?;
+    validate_source_label(&request.label)?;
+    connectors::validate_mastodon_instance_url(&request.instance_url).map_err(|_| {
+        AppError::validation(
+            "Use a public HTTPS Mastodon instance root, without a path, query, or credentials.",
+        )
+    })?;
+    let payload_hash = content_hash(&format!(
+        "{}\n{}",
+        request.label.trim(),
+        request.instance_url
+    ));
+    let admission = admit_external_command(state.database()?.begin_request(
+        &request.request_id,
+        "connect_mastodon",
+        &payload_hash,
+    )?)?;
+    if admission == ExternalCommandAdmission::ReplayComplete {
+        return Ok(());
+    }
+    let source_id = format!("mastodon-{}", uuid::Uuid::new_v4().simple());
+    let secret_ref = format!("mastodon-token-{}", uuid::Uuid::new_v4().simple());
+    if let Err(error) = state
+        .database()?
+        .record_pending_vault_cleanup(&request.request_id, &secret_ref)
+    {
+        state.database()?.abort_request(&request.request_id);
+        return Err(error);
+    }
+    let endpoints = match probe_mastodon_oauth_metadata(&request.instance_url).await {
+        Ok(value) => value,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_mastodon_probe_error(error));
+        }
+    };
+    let listener = match MastodonLoopbackCallback::bind().await {
+        Ok(value) => value,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_mastodon_probe_error(error));
+        }
+    };
+    let registration = match mastodon_registration_request(&endpoints, listener.redirect_uri()) {
+        Ok(value) => value,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_mastodon_probe_error(error));
+        }
+    };
+    let client = match register_mastodon_client(&registration).await {
+        Ok(value) => value,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_mastodon_probe_error(error));
+        }
+    };
+    let pkce = new_mastodon_pkce();
+    let authorization = match mastodon_authorization_url(
+        &endpoints,
+        &client.client_id,
+        listener.redirect_uri(),
+        &pkce,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_mastodon_probe_error(error));
+        }
+    };
+    if let Err(error) = open_authorization(&authorization) {
+        state.database()?.abort_request(&request.request_id);
+        return Err(error);
+    }
+    let code = match listener.receive(&pkce).await {
+        Ok(value) => value,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_mastodon_probe_error(error));
+        }
+    };
+    let token = match exchange_mastodon_authorization_code(&endpoints, &client, code, &pkce).await {
+        Ok(value) => value,
+        Err(error) => {
+            state.database()?.abort_request(&request.request_id);
+            return Err(map_mastodon_probe_error(error));
+        }
+    };
+    let mut database = state.database()?;
+    persist_mastodon_access_token(
+        &mut database,
+        &state.secrets,
+        &request,
+        &source_id,
+        &secret_ref,
+        token.expose(),
+    )
+}
+
+#[tauri::command]
+async fn connect_mastodon(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ConnectMastodonRequest,
+) -> AppResult<Dashboard> {
+    connect_mastodon_natively(&state, request, |authorization| {
+        app.opener()
+            .open_url(authorization.as_str(), None::<&str>)
+            .map_err(|_| {
+                AppError::unavailable("The system browser could not be opened for authorization.")
+            })
+    })
+    .await?;
+    state.dashboard().await
+}
+
+#[tauri::command]
+async fn export_opml(app: AppHandle, state: State<'_, AppState>) -> AppResult<bool> {
+    let bytes = {
+        let database = state.database()?;
+        render_opml_export(&database.opml_export_sources()?)?
+    };
+    let Some(path) = pick_opml_save_path(&app).await? else {
+        return Ok(false);
+    };
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temporary, bytes).map_err(|_| AppError::internal())?;
+    replace_export_backup(&temporary, &path)?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn export_backup(app: AppHandle, state: State<'_, AppState>) -> AppResult<bool> {
+    let Some(path) = pick_backup_save_path(&app).await? else {
+        return Ok(false);
+    };
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    {
+        let database = state.database()?;
+        database.backup_to(&temporary)?;
+    }
+    replace_export_backup(&temporary, &path)?;
+    Ok(true)
+}
+
+fn render_saved_items_export(
+    items: Vec<domain::LibraryItem>,
+    exported_at: chrono::DateTime<Utc>,
+) -> AppResult<Vec<u8>> {
+    serde_json::to_vec_pretty(&domain::SavedLibraryExport::new(
+        exported_at.to_rfc3339(),
+        items,
+    ))
+    .map_err(|_| AppError::internal())
+}
+
+#[tauri::command]
+async fn export_saved_items(app: AppHandle, state: State<'_, AppState>) -> AppResult<bool> {
+    let bytes = {
+        let database = state.database()?;
+        let items = database.saved_library_export()?;
+        if items.is_empty() {
+            return Err(AppError::validation(
+                "Save at least one item before creating a portable export.",
+            ));
+        }
+        render_saved_items_export(items, Utc::now())?
+    };
+    let Some(path) = pick_saved_items_export_path(&app).await? else {
+        return Ok(false);
+    };
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temporary, bytes).map_err(|_| AppError::internal())?;
+    replace_export_backup(&temporary, &path)?;
+    Ok(true)
+}
+
+/// Move an existing user backup aside before publishing the fresh snapshot. This avoids deleting
+/// the prior backup before the new file has a durable destination (notably on Windows, where
+/// rename does not replace an existing file).
+fn replace_export_backup(temporary: &Path, destination: &Path) -> AppResult<()> {
+    if !destination.exists() {
+        return std::fs::rename(temporary, destination).map_err(|_| AppError::internal());
+    }
+    let previous = destination.with_file_name(format!(
+        ".web-backup-replace-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::rename(destination, &previous)
+        .map_err(|_| AppError::validation("The existing backup could not be staged safely."))?;
+    if std::fs::rename(temporary, destination).is_err() {
+        let _ = std::fs::rename(&previous, destination);
+        return Err(AppError::validation(
+            "The new backup could not be saved; the previous backup was restored.",
+        ));
+    }
+    let _ = std::fs::remove_file(previous);
+    Ok(())
+}
+
+enum RestoreReplacement {
+    Replaced(Database),
+    RolledBack(Database),
+}
+
+fn cleanup_stale_restore_artifacts(directory: &Path) -> AppResult<()> {
+    let entries = std::fs::read_dir(directory).map_err(|_| AppError::internal())?;
+    for entry in entries {
+        let entry = entry.map_err(|_| AppError::internal())?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // Restore files are created only beside the application database. Keep cleanup deliberately
+        // narrow so an interrupted restore can never sweep up user-selected backups or other data.
+        if name == "web.restore-rollback.sqlite3"
+            || (name.starts_with("web.restore-") && name.ends_with(".sqlite3"))
+        {
+            let path = entry.path();
+            if path.is_file() {
+                std::fs::remove_file(path).map_err(|_| AppError::internal())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_database_files(path: &Path) -> std::io::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let target = PathBuf::from(format!("{}{suffix}", path.display()));
+        if target.exists() {
+            std::fs::remove_file(target)?;
+        }
+    }
+    Ok(())
+}
+
+fn reopen_rollback(main: &Path, rollback: &Path) -> AppResult<Database> {
+    remove_database_files(main).map_err(|_| AppError::internal())?;
+    std::fs::rename(rollback, main).map_err(|_| AppError::internal())?;
+    Database::open(main).map_err(|_| AppError::internal())
+}
+
+/// Replacing SQLite files requires closing the active handle on Windows. Every failure after that
+/// point must therefore reopen the independently-created rollback snapshot before the caller
+/// releases the mutex back to the application.
+fn replace_database_with_candidate<F>(
+    main: &Path,
+    candidate: &Path,
+    rollback: &Path,
+    reopen_candidate: F,
+) -> AppResult<RestoreReplacement>
+where
+    F: FnOnce(&Path) -> Result<Database, rusqlite::Error>,
+{
+    let result = (|| -> Result<Database, ()> {
+        remove_database_files(main).map_err(|_| ())?;
+        std::fs::rename(candidate, main).map_err(|_| ())?;
+        reopen_candidate(main).map_err(|_| ())
+    })();
+
+    match result {
+        Ok(database) => {
+            // A stale rollback is harmless but misleading, and it is not needed after the new
+            // database has successfully reopened.
+            let _ = std::fs::remove_file(rollback);
+            Ok(RestoreReplacement::Replaced(database))
+        }
+        Err(()) => {
+            let _ = std::fs::remove_file(candidate);
+            reopen_rollback(main, rollback).map(RestoreReplacement::RolledBack)
+        }
+    }
+}
+
+fn validate_restore_candidate(candidate: &Path) -> AppResult<()> {
+    // Opening validates SQLite integrity and runs every migration while the existing library is
+    // still open and untouched.
+    Database::open(candidate)
+        .map(drop)
+        .map_err(|_| AppError::validation("That file is not a compatible Web backup."))
+}
+
+#[tauri::command]
+async fn restore_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RestoreBackupRequest,
+) -> AppResult<Dashboard> {
+    validate_id(&request.request_id)?;
+    let Some(source) = pick_backup_restore_path(&app).await? else {
+        return state.dashboard().await;
+    };
+    let metadata = std::fs::metadata(&source)
+        .map_err(|_| AppError::validation("That backup could not be read."))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 2 * 1024 * 1024 * 1024 {
+        return Err(AppError::validation(
+            "Choose a non-empty local SQLite backup smaller than 2 GiB.",
+        ));
+    }
+    let _sync_guard = state.sync_gate.lock().await;
+    let restore_directory = state
+        .database_path
+        .parent()
+        .ok_or_else(AppError::internal)?
+        .join(".web-restore");
+    std::fs::create_dir_all(&restore_directory).map_err(|_| AppError::internal())?;
+    if source.starts_with(&restore_directory) {
+        return Err(AppError::validation(
+            "Choose a backup outside Web's temporary restore workspace.",
+        ));
+    }
+    cleanup_stale_restore_artifacts(&restore_directory)?;
+    let candidate = restore_directory.join(format!(
+        "web.restore-{}.sqlite3",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::copy(&source, &candidate)
+        .map_err(|_| AppError::validation("That backup could not be copied safely."))?;
+    if validate_restore_candidate(&candidate).is_err() {
+        let _ = std::fs::remove_file(&candidate);
+        return Err(AppError::validation(
+            "That file is not a compatible Web backup.",
+        ));
+    }
+    let rollback = restore_directory.join("web.restore-rollback.sqlite3");
+    {
+        let database = state.database()?;
+        if rollback.exists() {
+            let _ = std::fs::remove_file(&rollback);
+        }
+        database.backup_to(&rollback)?;
+    }
+    {
+        let mut database = state.database()?;
+        let replacement = Database::memory().map_err(|_| AppError::internal())?;
+        let prior = std::mem::replace(&mut *database, replacement);
+        drop(prior);
+    }
+    let main = state.database_path.clone();
+    match replace_database_with_candidate(&main, &candidate, &rollback, Database::open)? {
+        RestoreReplacement::Replaced(restored) => {
+            *state.database()? = restored;
+            state.dashboard().await
+        }
+        RestoreReplacement::RolledBack(restored) => {
+            *state.database()? = restored;
+            Err(AppError::validation(
+                "The backup could not replace your library. Your previous library was restored.",
+            ))
+        }
+    }
+}
+
 impl AppError {
     fn new_secure_store_failure() -> Self {
         Self::validation(
@@ -1104,10 +2063,22 @@ impl AppError {
     }
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            // A second launch must never create another resident scheduler against the same local
+            // database. Bring the existing calm digest forward instead.
+            show_main_window(app);
+        }))
         .plugin(
             tauri_plugin_opener::Builder::new()
                 .open_js_links_on_click(false)
@@ -1129,20 +2100,77 @@ pub fn run() {
                     let _ = state.resident_tick().await;
                 }
             });
+            let show = MenuItem::with_id(app, "show", "Show Web", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit Web", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let _tray = TrayIconBuilder::with_id("web-tray")
+                .tooltip("Web — your calm digest")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        show_main_window(app);
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        let app = tray.app_handle();
+                        show_main_window(app);
+                    }
+                })
+                .build(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let close_to_tray = window
+                    .state::<AppState>()
+                    .database()
+                    .and_then(|database| database.settings())
+                    .map(|settings| settings.close_to_tray)
+                    .unwrap_or(false);
+                if close_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             open_original,
             get_dashboard,
+            get_edition,
+            installed_models,
             run_digest,
             sync_sources,
+            sync_source,
             record_feedback,
             undo_feedback,
             update_settings,
             add_rss_source,
             import_archive,
             delete_source,
-            reset_learning
+            reset_learning,
+            search_library,
+            saved_library,
+            set_saved,
+            rename_source,
+            set_source_paused,
+            pick_opml,
+            discover_feeds,
+            probe_mastodon_instance,
+            connect_mastodon,
+            export_opml,
+            export_backup,
+            export_saved_items,
+            restore_backup
         ])
         .run(tauri::generate_context!())
         .expect("Web desktop runtime failed to start");
@@ -1153,6 +2181,37 @@ mod runtime_tests {
     use super::*;
     use crate::connectors::SyncPage;
     use std::sync::Arc;
+
+    fn seed_restore_database(path: &Path, marker: &str) {
+        let database = Database::open(path).expect("database");
+        database
+            .connection_for_test()
+            .execute_batch("CREATE TABLE restore_test_marker (value TEXT NOT NULL);")
+            .expect("marker table");
+        database
+            .connection_for_test()
+            .execute(
+                "INSERT INTO restore_test_marker(value) VALUES(?1)",
+                [marker],
+            )
+            .expect("marker value");
+    }
+
+    fn restore_marker(path: &Path) -> String {
+        rusqlite::Connection::open(path)
+            .expect("open marker database")
+            .query_row("SELECT value FROM restore_test_marker", [], |row| {
+                row.get(0)
+            })
+            .expect("marker value")
+    }
+
+    fn create_restore_rollback(main: &Path, rollback: &Path) {
+        Database::open(main)
+            .expect("main database")
+            .backup_to(rollback)
+            .expect("rollback backup");
+    }
 
     #[test]
     fn original_url_validation_accepts_only_bounded_credential_free_https() {
@@ -1207,6 +2266,262 @@ mod runtime_tests {
                 .as_str()
                 .is_some_and(|name| name.starts_with("opener:"))
         }));
+    }
+
+    #[test]
+    fn opml_export_is_bounded_escaped_and_round_trips_through_the_local_importer() {
+        let rendered = render_opml_export(&[
+            (
+                "Ada & Bob's feed".into(),
+                "https://example.com/feed?a=1&b=2".into(),
+            ),
+            ("<News>".into(), "https://example.net/atom.xml".into()),
+        ])
+        .expect("render OPML");
+        let text = std::str::from_utf8(&rendered).expect("UTF-8 OPML");
+        assert!(text.contains("Ada &amp; Bob&apos;s feed"));
+        assert!(text.contains("a=1&amp;b=2"));
+        let imported = parse_opml(&rendered).expect("round trip");
+        assert_eq!(
+            imported
+                .into_iter()
+                .map(|candidate| (candidate.label, candidate.url))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Ada & Bob's feed".into(),
+                    "https://example.com/feed?a=1&b=2".into()
+                ),
+                ("<News>".into(), "https://example.net/atom.xml".into()),
+            ]
+        );
+        assert!(render_opml_export(&[]).is_err());
+    }
+
+    #[test]
+    fn saved_item_export_is_versioned_portable_and_omits_database_identifiers() {
+        let rendered = render_saved_items_export(
+            vec![domain::LibraryItem {
+                id: "post-internal-id".into(),
+                source_id: "source-internal-id".into(),
+                source: "Practical AI Notes".into(),
+                author: "Ada".into(),
+                title: "A remembered idea".into(),
+                excerpt: "A local excerpt with useful context.".into(),
+                published_at: "2026-01-02T03:04:05Z".into(),
+                canonical_url: Some("https://example.test/idea".into()),
+                saved: true,
+                source_status: "healthy".into(),
+                source_health_detail: "Current runtime state.".into(),
+                summary_method: Some("extractive".into()),
+                summary_provider: Some("local fallback".into()),
+                summary_uncertainty: Some("Source excerpt only.".into()),
+            }],
+            "2026-01-03T04:05:06Z"
+                .parse::<chrono::DateTime<Utc>>()
+                .expect("fixed timestamp"),
+        )
+        .expect("render saved export");
+        let value: serde_json::Value = serde_json::from_slice(&rendered).expect("valid JSON");
+
+        assert_eq!(value["format"], "web-saved-items");
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["exportedAt"], "2026-01-03T04:05:06+00:00");
+        assert_eq!(value["items"][0]["title"], "A remembered idea");
+        assert_eq!(
+            value["items"][0]["canonicalUrl"],
+            "https://example.test/idea"
+        );
+        assert!(value["items"][0].get("id").is_none());
+        assert!(value["items"][0].get("sourceId").is_none());
+        assert!(value["items"][0].get("sourceStatus").is_none());
+    }
+
+    #[test]
+    fn export_replacement_publishes_a_new_backup_without_an_existing_destination() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let temporary = directory.path().join("backup.tmp");
+        let destination = directory.path().join("backup.sqlite3");
+        std::fs::write(&temporary, b"new backup").expect("temporary backup");
+
+        replace_export_backup(&temporary, &destination).expect("publish backup");
+
+        assert_eq!(
+            std::fs::read(&destination).expect("backup contents"),
+            b"new backup"
+        );
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn export_replacement_swaps_an_existing_backup_only_after_staging_it() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let temporary = directory.path().join("backup.tmp");
+        let destination = directory.path().join("backup.sqlite3");
+        std::fs::write(&temporary, b"new backup").expect("temporary backup");
+        std::fs::write(&destination, b"previous backup").expect("previous backup");
+
+        replace_export_backup(&temporary, &destination).expect("replace backup");
+
+        assert_eq!(
+            std::fs::read(&destination).expect("backup contents"),
+            b"new backup"
+        );
+        assert!(!temporary.exists());
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("directory")
+                .count(),
+            1,
+            "staged prior backup is cleaned after a successful replacement"
+        );
+    }
+
+    #[test]
+    fn failed_export_replacement_restores_the_existing_backup() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let temporary = directory.path().join("missing.tmp");
+        let destination = directory.path().join("backup.sqlite3");
+        std::fs::write(&destination, b"previous backup").expect("previous backup");
+
+        let error = replace_export_backup(&temporary, &destination).expect_err("publish fails");
+
+        assert_eq!(error.code, "VALIDATION");
+        assert_eq!(
+            std::fs::read(&destination).expect("restored backup"),
+            b"previous backup"
+        );
+    }
+
+    #[test]
+    fn malformed_restore_candidate_leaves_main_database_untouched() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let main = directory.path().join("web.sqlite3");
+        let candidate = directory.path().join("web.restore-malformed.sqlite3");
+        seed_restore_database(&main, "original library");
+        std::fs::write(&candidate, b"not a SQLite database").expect("malformed candidate");
+
+        let error = validate_restore_candidate(&candidate).expect_err("candidate must fail");
+        assert_eq!(error.code, "VALIDATION");
+        assert_eq!(restore_marker(&main), "original library");
+    }
+
+    #[test]
+    fn unsupported_restore_migration_leaves_main_database_untouched() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let main = directory.path().join("web.sqlite3");
+        let candidate = directory.path().join("web.restore-future.sqlite3");
+        seed_restore_database(&main, "original library");
+        let future = rusqlite::Connection::open(&candidate).expect("future candidate");
+        future
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+                 INSERT INTO schema_migrations(version, applied_at) VALUES(999, 0);",
+            )
+            .expect("future migration");
+        drop(future);
+
+        let error = validate_restore_candidate(&candidate).expect_err("future schema must fail");
+        assert_eq!(error.code, "VALIDATION");
+        assert_eq!(restore_marker(&main), "original library");
+    }
+
+    #[test]
+    fn failed_restore_rename_reopens_the_rollback_library() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let main = directory.path().join("web.sqlite3");
+        let candidate = directory.path().join("web.restore-candidate.sqlite3");
+        let rollback = directory.path().join("web.restore-rollback.sqlite3");
+        seed_restore_database(&main, "original library");
+        create_restore_rollback(&main, &rollback);
+        seed_restore_database(&candidate, "replacement library");
+        // Simulate an external delete after validation but before the replacement rename.
+        std::fs::remove_file(&candidate).expect("remove candidate");
+
+        match replace_database_with_candidate(&main, &candidate, &rollback, Database::open)
+            .expect("rollback recovery")
+        {
+            RestoreReplacement::RolledBack(database) => drop(database),
+            RestoreReplacement::Replaced(_) => {
+                panic!("rename failure must not replace the library")
+            }
+        }
+        assert_eq!(restore_marker(&main), "original library");
+        assert!(!rollback.exists());
+    }
+
+    #[test]
+    fn failed_restore_reopen_reopens_the_rollback_library() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let main = directory.path().join("web.sqlite3");
+        let candidate = directory.path().join("web.restore-candidate.sqlite3");
+        let rollback = directory.path().join("web.restore-rollback.sqlite3");
+        seed_restore_database(&main, "original library");
+        create_restore_rollback(&main, &rollback);
+        seed_restore_database(&candidate, "replacement library");
+
+        match replace_database_with_candidate(&main, &candidate, &rollback, |_| {
+            Err(rusqlite::Error::InvalidQuery)
+        })
+        .expect("rollback recovery")
+        {
+            RestoreReplacement::RolledBack(database) => drop(database),
+            RestoreReplacement::Replaced(_) => {
+                panic!("reopen failure must not replace the library")
+            }
+        }
+        assert_eq!(restore_marker(&main), "original library");
+        assert!(!rollback.exists());
+    }
+
+    #[test]
+    fn stale_restore_artifacts_are_cleaned_without_touching_other_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "web.restore-previous.sqlite3",
+            "web.restore-rollback.sqlite3",
+        ] {
+            std::fs::write(directory.path().join(name), b"stale").expect("stale artifact");
+        }
+        let unrelated = directory.path().join("my-precious-backup.sqlite3");
+        std::fs::write(&unrelated, b"keep").expect("unrelated backup");
+
+        cleanup_stale_restore_artifacts(directory.path()).expect("cleanup");
+
+        assert!(
+            !directory
+                .path()
+                .join("web.restore-previous.sqlite3")
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join("web.restore-rollback.sqlite3")
+                .exists()
+        );
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn successful_restore_replaces_the_library_and_cleans_rollback() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let main = directory.path().join("web.sqlite3");
+        let candidate = directory.path().join("web.restore-candidate.sqlite3");
+        let rollback = directory.path().join("web.restore-rollback.sqlite3");
+        seed_restore_database(&main, "original library");
+        create_restore_rollback(&main, &rollback);
+        seed_restore_database(&candidate, "replacement library");
+
+        match replace_database_with_candidate(&main, &candidate, &rollback, Database::open)
+            .expect("replacement")
+        {
+            RestoreReplacement::Replaced(database) => drop(database),
+            RestoreReplacement::RolledBack(_) => panic!("valid replacement must win"),
+        }
+        assert_eq!(restore_marker(&main), "replacement library");
+        assert!(!candidate.exists());
+        assert!(!rollback.exists());
     }
 
     #[test]
@@ -1894,5 +3209,158 @@ mod runtime_tests {
             + MAX_MODEL_ITEMS_PER_BATCH as u64 * MODEL_ITEM_TIMEOUT_SECS)
             * 1_000;
         assert!(worst_case_ms <= RUNNER_DEADLINE.as_millis() as u64);
+    }
+
+    #[derive(Default)]
+    struct TestSecretStore {
+        values: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+        fail_put: bool,
+        fail_delete: bool,
+    }
+
+    impl SecretStore for TestSecretStore {
+        fn put(&self, reference: &str, secret: &str) -> Result<(), secrets::SecretStoreError> {
+            if self.fail_put {
+                return Err(secrets::SecretStoreError::Unavailable);
+            }
+            self.values
+                .lock()
+                .expect("test vault lock")
+                .insert(reference.to_owned(), secret.to_owned());
+            Ok(())
+        }
+
+        fn get(&self, reference: &str) -> Result<String, secrets::SecretStoreError> {
+            self.values
+                .lock()
+                .expect("test vault lock")
+                .get(reference)
+                .cloned()
+                .ok_or(secrets::SecretStoreError::Unavailable)
+        }
+
+        fn delete(&self, reference: &str) -> Result<(), secrets::SecretStoreError> {
+            if self.fail_delete {
+                return Err(secrets::SecretStoreError::Unavailable);
+            }
+            self.values
+                .lock()
+                .expect("test vault lock")
+                .remove(reference);
+            Ok(())
+        }
+    }
+
+    fn pending_mastodon_request(
+        database: &Database,
+        request: &ConnectMastodonRequest,
+        secret_ref: &str,
+    ) {
+        let payload = content_hash(&format!("{}\n{}", request.label, request.instance_url));
+        assert_eq!(
+            database
+                .begin_request(&request.request_id, "connect_mastodon", &payload)
+                .expect("begin request"),
+            RequestDisposition::New
+        );
+        database
+            .record_pending_vault_cleanup(&request.request_id, secret_ref)
+            .expect("pending cleanup");
+    }
+
+    #[test]
+    fn mastodon_vault_and_source_commit_as_one_recoverable_handoff() {
+        let mut database = Database::memory().expect("database");
+        let vault = TestSecretStore::default();
+        let request = ConnectMastodonRequest {
+            request_id: "mastodon-connect-one".into(),
+            label: "My Mastodon".into(),
+            instance_url: "https://mastodon.social".into(),
+        };
+        pending_mastodon_request(&database, &request, "mastodon-token-one");
+
+        persist_mastodon_access_token(
+            &mut database,
+            &vault,
+            &request,
+            "mastodon-one",
+            "mastodon-token-one",
+            "token-value",
+        )
+        .expect("commit connection");
+
+        assert_eq!(
+            database
+                .connection_for_test()
+                .query_row(
+                    "SELECT status FROM sources WHERE id='mastodon-one'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("source status"),
+            "healthy"
+        );
+        assert_eq!(
+            database
+                .connection_for_test()
+                .query_row(
+                    "SELECT state FROM request_receipts WHERE request_id='mastodon-connect-one'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("completed receipt"),
+            "complete"
+        );
+        assert!(
+            database
+                .pending_vault_cleanups()
+                .expect("pending rows")
+                .is_empty()
+        );
+        assert_eq!(
+            vault.get("mastodon-token-one").expect("stored token"),
+            "token-value"
+        );
+    }
+
+    #[test]
+    fn indeterminate_vault_write_stays_sealed_with_a_non_secret_cleanup_reference() {
+        let mut database = Database::memory().expect("database");
+        let vault = TestSecretStore {
+            fail_put: true,
+            ..Default::default()
+        };
+        let request = ConnectMastodonRequest {
+            request_id: "mastodon-connect-two".into(),
+            label: "My Mastodon".into(),
+            instance_url: "https://mastodon.social".into(),
+        };
+        pending_mastodon_request(&database, &request, "mastodon-token-two");
+
+        assert!(
+            persist_mastodon_access_token(
+                &mut database,
+                &vault,
+                &request,
+                "mastodon-two",
+                "mastodon-token-two",
+                "token-value",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            database.pending_vault_cleanups().expect("pending rows"),
+            vec![("mastodon-connect-two".into(), "mastodon-token-two".into())]
+        );
+        assert_eq!(
+            database
+                .begin_request(
+                    "mastodon-connect-two",
+                    "connect_mastodon",
+                    "anything-different",
+                )
+                .expect("sealed request"),
+            RequestDisposition::Unknown
+        );
     }
 }

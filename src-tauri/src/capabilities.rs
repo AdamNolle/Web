@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_capability_grants_no_unused_core_defaults() {
+    fn renderer_capability_grants_only_the_cross_platform_zoom_permission() {
         let capability = include_str!("../capabilities/main.json");
         assert!(!capability.contains("core:default"));
         let parsed: serde_json::Value = serde_json::from_str(capability).expect("capability json");
@@ -143,8 +143,10 @@ mod tests {
             parsed
                 .get("permissions")
                 .and_then(|value| value.as_array())
-                .map(Vec::len),
-            Some(0)
+                .cloned(),
+            Some(vec![serde_json::Value::String(
+                "core:webview:allow-set-webview-zoom".into()
+            )])
         );
     }
 

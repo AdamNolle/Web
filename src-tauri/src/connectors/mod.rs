@@ -1,4 +1,5 @@
 pub mod export_import;
+mod mastodon;
 mod rss;
 
 use std::fmt;
@@ -8,6 +9,14 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::Zeroizing;
 
+pub use mastodon::{
+    MASTODON_REQUIRED_SCOPES, MastodonAccessToken, MastodonAuthorizationCode, MastodonConnector,
+    MastodonLoopbackCallback, MastodonOAuthEndpoints, MastodonPkce, MastodonRegisteredClient,
+    MastodonRegistrationRequest, exchange_mastodon_authorization_code, mastodon_authorization_url,
+    mastodon_registration_request, new_mastodon_pkce, parse_mastodon_authorization_callback,
+    parse_mastodon_registered_client, probe_mastodon_instance, register_mastodon_client,
+    validate_mastodon_instance_url, validate_mastodon_oauth_metadata,
+};
 pub use rss::{RssConnector, validate_public_feed_url, validate_sync_request};
 
 pub const MAX_ITEMS_PER_SYNC: usize = 100;
@@ -65,9 +74,9 @@ pub fn connector_descriptors() -> Vec<ConnectorDescriptor> {
             kind: "mastodon".into(),
             label: "Mastodon".into(),
             availability: ConnectorAvailability::ValidationRequired,
-            detail: "Official read-only home timeline and bounded context are planned.".into(),
+            detail: "Read-only home timeline and bounded context require verified per-instance OAuth metadata.".into(),
             unmet_prerequisite: Some(
-                "Instance OAuth compatibility and provider policy review are required before connection is enabled."
+                "A user-authorized native OAuth flow, OS-vault token lifecycle, and packaged provider acceptance are required before connection is enabled."
                     .into(),
             ),
             read_only: true,
@@ -352,7 +361,7 @@ impl SyncBatch {
             {
                 return Err(ConnectorError::ResponseTooLarge);
             }
-            if self.comment_completeness != CommentCompleteness::Unavailable
+            if self.comment_completeness == CommentCompleteness::Complete
                 && !scope.contains(post.remote_id.as_str())
             {
                 return Err(ConnectorError::InvalidFeed);

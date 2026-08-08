@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
@@ -8,6 +8,8 @@ import type { Dashboard } from './types';
 
 beforeEach(() => {
   setTransportForTests(createDemoTransport());
+  Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+  Object.defineProperty(navigator, 'userAgentData', { configurable: true, value: undefined });
   const storedPresentationState = new Map<string, string>();
   Object.defineProperty(window, 'localStorage', {
     configurable: true,
@@ -127,9 +129,12 @@ describe('calm dashboard', () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByRole('heading', { name: 'Good morning.' });
+    expect(screen.getByRole('button', { name: /Search & commands/ })).toHaveTextContent('Ctrl K');
     const origin = screen.getByRole('button', { name: 'Sources' });
     origin.focus();
 
+    await user.keyboard('{Meta>}k{/Meta}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     await user.keyboard('{Control>}k{/Control}');
     const dialog = screen.getByRole('dialog', { name: 'Command palette' });
     expect(dialog).toHaveAttribute('aria-modal', 'true');
@@ -149,7 +154,7 @@ describe('calm dashboard', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     await waitFor(() => expect(origin).toHaveFocus());
 
-    await user.keyboard('{Meta>}k{/Meta}');
+    await user.keyboard('{Control>}k{/Control}');
     const reopened = screen.getByRole('dialog', { name: 'Command palette' });
     const reopenedSearch = within(reopened).getByRole('combobox', { name: 'Search commands' });
     await user.type(reopenedSearch, 'Trends');
@@ -158,6 +163,121 @@ describe('calm dashboard', () => {
     await waitFor(() =>
       expect(screen.getByRole('heading', { name: 'Trends, without the hype.' })).toHaveFocus(),
     );
+  });
+
+  it('does not repeatedly toggle the command palette when its shortcut is held', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+
+    fireEvent.keyDown(document, { key: 'k', ctrlKey: true });
+    expect(screen.getByRole('dialog', { name: 'Command palette' })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'k', ctrlKey: true, repeat: true });
+    expect(screen.getByRole('dialog', { name: 'Command palette' })).toBeInTheDocument();
+  });
+
+  it('uses the Command shortcut only on Apple platforms', async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(navigator, 'platform');
+    const originalClientHints = Object.getOwnPropertyDescriptor(navigator, 'userAgentData');
+    // Client Hints win over legacy platform/UA strings, which may be spoofed by an embedded WebView.
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    Object.defineProperty(navigator, 'userAgentData', {
+      configurable: true,
+      value: { platform: 'macOS' },
+    });
+    try {
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByRole('heading', { name: 'Good morning.' });
+      expect(screen.getByRole('button', { name: /Search & commands/ })).toHaveTextContent('⌘ K');
+
+      await user.keyboard('{Control>}k{/Control}');
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      await user.keyboard('{Meta>}k{/Meta}');
+      expect(screen.getByRole('dialog', { name: 'Command palette' })).toBeInTheDocument();
+    } finally {
+      if (originalPlatform) Object.defineProperty(navigator, 'platform', originalPlatform);
+      else Reflect.deleteProperty(navigator, 'platform');
+      if (originalClientHints)
+        Object.defineProperty(navigator, 'userAgentData', originalClientHints);
+      else Reflect.deleteProperty(navigator, 'userAgentData');
+    }
+  });
+
+  it('uses the Control shortcut on Windows and Linux', async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(navigator, 'platform');
+    const originalClientHints = Object.getOwnPropertyDescriptor(navigator, 'userAgentData');
+    try {
+      for (const platform of ['Windows', 'Linux']) {
+        // Deliberately conflict with the legacy value: the active platform signal controls both
+        // the visible hint and the accepted modifier.
+        Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+        Object.defineProperty(navigator, 'userAgentData', {
+          configurable: true,
+          value: { platform },
+        });
+        const user = userEvent.setup();
+        const { unmount } = render(<App />);
+        await screen.findByRole('heading', { name: 'Good morning.' });
+        expect(screen.getByRole('button', { name: /Search & commands/ })).toHaveTextContent(
+          'Ctrl K',
+        );
+
+        await user.keyboard('{Meta>}k{/Meta}');
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        await user.keyboard('{Control>}k{/Control}');
+        expect(screen.getByRole('dialog', { name: 'Command palette' })).toBeInTheDocument();
+        unmount();
+      }
+    } finally {
+      if (originalPlatform) Object.defineProperty(navigator, 'platform', originalPlatform);
+      else Reflect.deleteProperty(navigator, 'platform');
+      if (originalClientHints)
+        Object.defineProperty(navigator, 'userAgentData', originalClientHints);
+      else Reflect.deleteProperty(navigator, 'userAgentData');
+    }
+  });
+
+  it('persists reading scale and names the zoom shortcut for the active platform', async () => {
+    const user = userEvent.setup();
+    const rendered = render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Privacy & settings' }));
+
+    const scaleControl = screen.getByRole('group', { name: 'Page scale' });
+    expect(within(scaleControl).getByRole('radio', { name: '100%' })).toBeChecked();
+    expect(screen.getByText(/You can also use Ctrl \+ \/ −/)).toBeInTheDocument();
+
+    await user.click(within(scaleControl).getByRole('radio', { name: '200%' }));
+    await waitFor(() => expect(window.localStorage.getItem('web.presentation.zoom')).toBe('2'));
+    expect(within(scaleControl).getByRole('radio', { name: '200%' })).toBeChecked();
+
+    rendered.unmount();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Privacy & settings' }));
+    expect(screen.getByRole('radio', { name: '200%' })).toBeChecked();
+  });
+
+  it('uses the Command zoom hint on Apple platforms', async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(navigator, 'platform');
+    const originalClientHints = Object.getOwnPropertyDescriptor(navigator, 'userAgentData');
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    Object.defineProperty(navigator, 'userAgentData', {
+      configurable: true,
+      value: { platform: 'macOS' },
+    });
+    try {
+      render(<App />);
+      await screen.findByRole('heading', { name: 'Good morning.' });
+      await userEvent.click(screen.getByRole('button', { name: 'Privacy & settings' }));
+      expect(screen.getByText(/You can also use ⌘ \+ \/ −/)).toBeInTheDocument();
+    } finally {
+      if (originalPlatform) Object.defineProperty(navigator, 'platform', originalPlatform);
+      else Reflect.deleteProperty(navigator, 'platform');
+      if (originalClientHints)
+        Object.defineProperty(navigator, 'userAgentData', originalClientHints);
+      else Reflect.deleteProperty(navigator, 'userAgentData');
+    }
   });
 
   it('persists explicit themes and follows system changes only in Auto mode', async () => {
@@ -292,6 +412,43 @@ describe('calm dashboard', () => {
     expect(within(learningPanel).getByText('0')).toBeInTheDocument();
   });
 
+  it('confirms backup restore in an accessible dialog without a browser prompt', async () => {
+    const base = createDemoTransport();
+    const restoreBackup = vi.fn(async () => base.getDashboard());
+    const restoring = new Proxy(base, {
+      get(target, property, receiver) {
+        if (property === 'restoreBackup') return restoreBackup;
+        return Reflect.get(target, property, receiver);
+      },
+    }) as AppTransport;
+    setTransportForTests(restoring);
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Privacy & settings' }));
+    const restore = screen.getByRole('button', { name: 'Restore backup' });
+    restore.focus();
+    await user.click(restore);
+
+    const dialog = screen.getByRole('dialog', { name: 'Restore a local backup?' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    const confirm = within(dialog).getByRole('button', { name: 'Choose backup and restore' });
+    await waitFor(() => expect(confirm).toHaveFocus());
+    await user.keyboard('{Escape}');
+    expect(
+      screen.queryByRole('dialog', { name: 'Restore a local backup?' }),
+    ).not.toBeInTheDocument();
+    await waitFor(() => expect(restore).toHaveFocus());
+
+    await user.click(restore);
+    await user.click(screen.getByRole('button', { name: 'Choose backup and restore' }));
+    await waitFor(() => expect(restoreBackup).toHaveBeenCalledOnce());
+    expect(
+      screen.queryByRole('dialog', { name: 'Restore a local backup?' }),
+    ).not.toBeInTheDocument();
+  });
+
   it('explains local model and connector boundaries', async () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Good morning.' });
@@ -299,6 +456,7 @@ describe('calm dashboard', () => {
     expect(screen.getByRole('heading', { name: 'Privacy & settings.' })).toBeInTheDocument();
     expect(screen.getByText(/Loopback endpoint with proxy bypass/)).toBeInTheDocument();
     expect(screen.getByLabelText(/Explicit installed Ollama model/)).toHaveValue('');
+    expect(screen.getByText(/On Windows, install and start Ollama yourself/)).toBeInTheDocument();
     expect(screen.getByText(/does not collect dwell time/)).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Sources' }));
@@ -550,7 +708,6 @@ describe('calm dashboard', () => {
       },
     }) as AppTransport;
     setTransportForTests(ordered);
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<App />);
     await screen.findByRole('heading', { name: 'Good morning.' });
     await waitFor(() => expect(resolvePoll).toBeDefined());
@@ -559,6 +716,7 @@ describe('calm dashboard', () => {
       .getByRole('heading', { name: 'Practical AI Notes' })
       .closest('article')!;
     await userEvent.click(within(sourceCard).getByRole('button', { name: 'Disconnect & delete' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Disconnect and delete' }));
     await userEvent.click(screen.getByRole('button', { name: 'Today' }));
     await waitFor(() => expect(screen.queryByText(removed.title)).not.toBeInTheDocument());
     await act(async () => {
@@ -767,6 +925,80 @@ describe('calm dashboard', () => {
     expect(screen.queryByLabelText(/token|password|credential/i)).not.toBeInTheDocument();
   });
 
+  it('checks Mastodon metadata in the native app without treating it as a connection', async () => {
+    const base = createDemoTransport();
+    const probeMastodonInstance = vi.fn(async (instanceUrl: string) => ({
+      instanceUrl,
+      supportedScopes: ['read:accounts', 'read:statuses'],
+      connectionEnabled: false as const,
+    }));
+    const nativeTransport = new Proxy(base, {
+      get(target, property, receiver) {
+        if (property === 'probeMastodonInstance') return probeMastodonInstance;
+        return Reflect.get(target, property, receiver);
+      },
+    }) as AppTransport;
+    setTransportForTests(nativeTransport);
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+    try {
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByRole('heading', { name: 'Good morning.' });
+      await user.click(screen.getByRole('button', { name: 'Sources' }));
+      await user.type(screen.getByLabelText('Mastodon instance'), 'https://social.example/');
+      await user.click(screen.getByRole('button', { name: 'Check compatibility' }));
+
+      await waitFor(() =>
+        expect(probeMastodonInstance).toHaveBeenCalledWith('https://social.example/'),
+      );
+      expect(
+        screen.getByText(/Compatible read scopes: read:accounts, read:statuses/),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/https:\/\/social.example\/ is compatible. It is not connected/),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /connect mastodon/i })).not.toBeInTheDocument();
+    } finally {
+      Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
+    }
+  });
+
+  it('renames and deletes sources through accessible in-app dialogs', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Sources' }));
+
+    const initialCard = screen
+      .getByRole('heading', { name: 'Practical AI Notes' })
+      .closest('article')!;
+    await user.click(within(initialCard).getByRole('button', { name: 'Rename' }));
+    const renameDialog = screen.getByRole('dialog', { name: 'Rename Practical AI Notes' });
+    expect(renameDialog).toHaveAttribute('aria-modal', 'true');
+    const sourceName = within(renameDialog).getByLabelText('Source name');
+    await waitFor(() => expect(sourceName).toHaveFocus());
+    await user.clear(sourceName);
+    await user.type(sourceName, 'Calm AI Notes');
+    await user.click(within(renameDialog).getByRole('button', { name: 'Save name' }));
+    await screen.findByRole('heading', { name: 'Calm AI Notes' });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    const renamedCard = screen.getByRole('heading', { name: 'Calm AI Notes' }).closest('article')!;
+    const deleteTrigger = within(renamedCard).getByRole('button', { name: 'Disconnect & delete' });
+    await user.click(deleteTrigger);
+    const deleteDialog = screen.getByRole('dialog', { name: 'Delete Calm AI Notes?' });
+    expect(within(deleteDialog).getByText(/This cannot be undone/)).toBeInTheDocument();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(deleteTrigger).toHaveFocus());
+
+    await user.click(deleteTrigger);
+    await user.click(screen.getByRole('button', { name: 'Disconnect and delete' }));
+    await waitFor(() =>
+      expect(screen.queryByRole('heading', { name: 'Calm AI Notes' })).not.toBeInTheDocument(),
+    );
+  });
+
   it('imports an official archive through the native picker contract', async () => {
     const user = userEvent.setup();
     const base = createDemoTransport();
@@ -828,8 +1060,171 @@ describe('calm dashboard', () => {
     expect(screen.getByText('Manual re-import only')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Activity' }));
-    const archiveHealthRow = screen.getByRole('row', { name: /Family Instagram archive/ });
+    const archiveHealthRow = await screen.findByRole('row', { name: /Family Instagram archive/ });
     expect(within(archiveHealthRow).getByText('Manual re-import only')).toBeInTheDocument();
+  });
+
+  it('retains only failed reviewed feeds for accessible edit and retry', async () => {
+    const user = userEvent.setup();
+    const attempts: Array<{ label: string; url: string }> = [];
+    const base = createDemoTransport();
+    setTransportForTests(
+      new Proxy(base, {
+        get(target, property, receiver) {
+          if (property === 'pickOpml') {
+            return async () => [
+              { label: 'Ready feed', url: 'https://ready.example.test/feed.xml' },
+              { label: 'Needs repair', url: 'https://broken.example.test/feed.xml' },
+            ];
+          }
+          if (property === 'addRssSource') {
+            return async (_requestId: string, label: string, url: string) => {
+              attempts.push({ label, url });
+              if (url.includes('broken.example.test')) throw new Error('This feed is unavailable.');
+              return structuredClone(demoDashboard);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      }) as AppTransport,
+    );
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Sources' }));
+    await user.click(screen.getByRole('button', { name: 'Choose OPML file' }));
+    await screen.findByText('2 feeds are ready for review.');
+    await user.click(screen.getByRole('button', { name: 'Add reviewed feeds' }));
+
+    await screen.findByText(/Added 1 of 2 reviewed feeds/);
+    expect(screen.getByText('Ready feed: added')).toBeInTheDocument();
+    expect(screen.getByText('Needs repair: not added')).toBeInTheDocument();
+    const failedRow = screen.getByRole('group', { name: 'Feed that needs attention' });
+    const failedUrl = within(failedRow).getByLabelText('RSS or Atom URL');
+    await user.clear(failedUrl);
+    await user.type(failedUrl, 'https://repaired.example.test/feed.xml');
+    await user.click(within(failedRow).getByRole('button', { name: 'Retry Needs repair' }));
+
+    await waitFor(() =>
+      expect(attempts).toContainEqual({
+        label: 'Needs repair',
+        url: 'https://repaired.example.test/feed.xml',
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('group', { name: 'Feed that needs attention' }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText('Needs repair: added')).toBeInTheDocument();
+  });
+
+  it('moves through local Library results with a roving keyboard focus', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    const query = screen.getByLabelText('Search your local library');
+    await user.type(query, 'local');
+    await user.click(screen.getByRole('button', { name: 'Search' }));
+    await screen.findByText(/local matches\./);
+    expect(screen.getByText(/From the search field, press Down Arrow/)).toBeInTheDocument();
+
+    query.focus();
+    await user.keyboard('{ArrowDown}');
+    const first = screen.getByRole('article', { name: /Search result 1 of/ });
+    await waitFor(() => expect(first).toHaveFocus());
+    await user.keyboard('{End}');
+    const last = screen.getAllByRole('article', { name: /Search result/ }).at(-1)!;
+    await waitFor(() => expect(last).toHaveFocus());
+    await user.keyboard('{Home}');
+    await waitFor(() => expect(first).toHaveFocus());
+  });
+
+  it('keeps the Library shelf truthful as explicitly saved items are added and removed', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    const query = screen.getByLabelText('Search your local library');
+    await user.type(query, 'local');
+    await user.click(screen.getByRole('button', { name: 'Search' }));
+
+    const save = (await screen.findAllByRole('button', { name: 'Save for later' }))[0]!;
+    await user.click(save);
+    await screen.findByText('Saved for later.');
+    expect(screen.getByRole('button', { name: 'Remove from saved' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Saved (1)' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Saved (1)' }));
+    await screen.findByText('1 saved items.');
+    const remove = screen.getByRole('button', { name: 'Remove from saved' });
+    await user.click(remove);
+    await screen.findByText('Removed from saved items.');
+    expect(
+      screen.getByText('Save a useful item from an edition to return to it later.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Saved (0)' })).toBeInTheDocument();
+  });
+
+  it('exports explicitly saved items through the native transport without exposing a web download', async () => {
+    const user = userEvent.setup();
+    const dashboard = structuredClone(demoDashboard);
+    dashboard.library.savedCount = 1;
+    const base = createDemoTransport();
+    const exportSavedItems = vi.fn(async () => true);
+    setTransportForTests(
+      new Proxy(base, {
+        get(target, property, receiver) {
+          if (property === 'getDashboard') return async () => structuredClone(dashboard);
+          if (property === 'exportSavedItems') return exportSavedItems;
+          return Reflect.get(target, property, receiver);
+        },
+      }) as AppTransport,
+    );
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    const exportButton = screen.getByRole('button', { name: 'Export saved items' });
+    expect(exportButton).toBeEnabled();
+    await user.click(exportButton);
+
+    await waitFor(() => expect(exportSavedItems).toHaveBeenCalledOnce());
+    expect(
+      screen.getByText('Status: Saved items exported as a portable JSON file.'),
+    ).toBeInTheDocument();
+  });
+
+  it('opens local item details with Escape return and source navigation', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Good morning.' });
+    await user.click(screen.getByRole('button', { name: 'Library' }));
+    const query = screen.getByLabelText('Search your local library');
+    await user.type(query, 'local');
+    await user.click(screen.getByRole('button', { name: 'Search' }));
+    const details = await screen.findByRole('button', {
+      name: /Read details for Smaller local models/,
+    });
+    await user.click(details);
+
+    const dialog = screen.getByRole('dialog', {
+      name: /Smaller local models are becoming better everyday tools/,
+    });
+    expect(within(dialog).getByText(/retained local excerpt/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Source health:/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Summary:/)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(dialog).getByRole('button', { name: 'Close details' })).toHaveFocus(),
+    );
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(details).toHaveFocus());
+
+    await user.click(details);
+    await user.click(screen.getByRole('button', { name: 'View source' }));
+    await screen.findByRole('heading', { name: 'Your sources.' });
+    await waitFor(() => expect(document.getElementById('source-card-source-rss-ai')).toHaveFocus());
   });
 
   it('routes first-run source actions to the relevant focused controls', async () => {

@@ -18,6 +18,11 @@
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-black">
 </p>
 
+Windows, macOS, and Linux are build targets. This local alpha has a three-host compile matrix, but
+each host still needs packaged runtime and release-trust evidence before it is called supported.
+See the evidence-based [platform support matrix](docs/release/support-matrix.md) for the exact
+architecture and host status.
+
 <!-- Replace the pre-redesign screenshot with a fresh native WebView capture before public release. -->
 
 ## Why this exists
@@ -46,19 +51,20 @@ architecture below has been through repeated independent adversarial
 security/correctness/UX review; see [`REMAINING-WORK.md`](REMAINING-WORK.md)
 for a from-scratch audit of what's real vs. aspirational.
 
-| Area                   | Status                                                                                                                                                                                                                                                     |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| RSS/Atom sources       | **Live.** SSRF-hardened fetch (DNS pinning, private/link-local/reserved-range rejection, redirect re-validation, and HTTPS-downgrade rejection), conditional resync, retention.                                                                            |
-| X / Instagram archives | **Live in the current working tree.** Native streaming import of official X `tweets.js`/`tweet.js` and Instagram `posts_1.json` exports, bounded to 20 MiB and 25,000 entries. Files stay local; imports are replay-safe and manually repeatable.          |
-| Local summarization    | **Live.** Loopback-only Ollama integration with schema-validated structured output, exact model-digest attestation, and a deterministic no-model fallback.                                                                                                 |
-| Persistence            | **Live.** Rust-owned SQLite, transactional version-gated migrations, WAL, foreign keys, generation-fenced deletion, privacy-epoch invalidation.                                                                                                            |
-| Credentials            | **Live.** OS vault only (Windows Credential Manager / macOS Keychain / Linux Secret Service), fail-closed, no plaintext fallback.                                                                                                                          |
-| Scheduling             | **Partial.** Runs only while the app window is open; no tray/background execution yet.                                                                                                                                                                     |
-| Ranking                | **Live, bounded.** Explicit-feedback-only (More/Less), per-source, gated by a minimum-signal threshold, with a 25% chronological/diversity reserve and a per-item why-shown reason; pausable in Settings. No passive/behavioral signals exist or are read. |
-| Trends                 | **Live, bounded.** Deterministic lexical clustering runs as part of every digest: cross-source gate (a single source repeating itself is never a trend), same-source dedup collapse, deterministic fallback label. No model decides membership.            |
-| Original source links  | **Live in the current working tree.** An explicit evidence action asks Rust to open only credential-free HTTPS URLs of at most 2 KiB. The renderer has no general shell/opener permission.                                                                 |
-| Mastodon / Bluesky     | **Not active.** Provider-neutral contracts and disabled descriptors exist; live OAuth connectors remain behind provider/policy/native-flow evidence tracked in `REMAINING-WORK.md`.                                                                        |
-| Reddit                 | **Not implemented.** Access, cost, retention, and commercial-use terms require a fresh decision before engineering starts.                                                                                                                                 |
+| Area                   | Status                                                                                                                                                                                                                                                                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RSS/Atom sources       | **Live.** SSRF-hardened fetch (DNS pinning, private/link-local/reserved-range rejection, redirect re-validation, and HTTPS-downgrade rejection), conditional resync, retention.                                                                                                                                                                                     |
+| X / Instagram archives | **Live in the current working tree.** Native streaming import of official X `tweets.js`/`tweet.js` and Instagram `posts_1.json` exports, bounded to 20 MiB and 25,000 entries. Files stay local; imports are replay-safe and manually repeatable.                                                                                                                   |
+| Local summarization    | **Live.** Loopback-only Ollama integration with schema-validated structured output, exact model-digest attestation, and a deterministic no-model fallback.                                                                                                                                                                                                          |
+| Persistence            | **Live.** Rust-owned SQLite, transactional version-gated migrations, WAL, foreign keys, generation-fenced deletion, privacy-epoch invalidation.                                                                                                                                                                                                                     |
+| Credentials            | **Live.** OS vault only (Windows Credential Manager / macOS Keychain / Linux Secret Service), fail-closed, no plaintext fallback.                                                                                                                                                                                                                                   |
+| Scheduling             | **Partial.** A process-resident runner and close-to-tray preference exist in the current working tree; OS wake, sleep/resume, and packaged lifecycle evidence remain open.                                                                                                                                                                                          |
+| Library / history      | **Live in the current working tree.** Bounded SQLite FTS5 search, explicit Saved/read-later retention, portable versioned JSON export through a native save dialog, keyboard navigation, accessible item details/source navigation, readable prior editions, and a finite since-last-edition summary. Native assistive-technology and picker evidence remains open. |
+| Ranking                | **Live, bounded.** Explicit-feedback-only (More/Less), per-source, gated by a minimum-signal threshold, with a 25% chronological/diversity reserve and a per-item why-shown reason; pausable in Settings. No passive/behavioral signals exist or are read.                                                                                                          |
+| Trends                 | **Live, bounded.** Deterministic lexical clustering runs as part of every digest: cross-source gate (a single source repeating itself is never a trend), same-source dedup collapse, deterministic fallback label. No model decides membership.                                                                                                                     |
+| Original source links  | **Live in the current working tree.** An explicit evidence action asks Rust to open only credential-free HTTPS URLs of at most 2 KiB. The renderer has no general shell/opener permission.                                                                                                                                                                          |
+| Mastodon / Bluesky     | **Not active.** Mastodon can perform a user-initiated, bounded compatibility preflight against an instance's public OAuth metadata, but it cannot connect an account. Live OAuth connectors remain behind provider/policy/native-flow evidence tracked in `REMAINING-WORK.md`.                                                                                      |
+| Reddit                 | **Not implemented.** Access, cost, retention, and commercial-use terms require a fresh decision before engineering starts.                                                                                                                                                                                                                                          |
 
 ## Architecture
 
@@ -77,11 +83,12 @@ for a from-scratch audit of what's real vs. aspirational.
 ```
 
 React never touches the network, the filesystem, or SQLite directly — every
-action is a narrow, typed Rust command. The renderer's Tauri capability
-grants **zero** built-in permissions; everything it can do is explicitly
-listed. See [`docs/adr/`](docs/adr) for the durable architectural decisions
-and [`docs/security/threat-model.md`](docs/security/threat-model.md) for the
-full asset/threat/control breakdown.
+action is a narrow, typed Rust command. The renderer grants one built-in
+capability only: page zoom, needed for Tauri's macOS/Linux keyboard-zoom
+polyfill. It grants no filesystem, shell, network, opener, or general window
+access. See [`docs/adr/`](docs/adr) for the durable architectural decisions and
+[`docs/security/threat-model.md`](docs/security/threat-model.md) for the full
+asset/threat/control breakdown.
 
 ## Getting started
 
@@ -107,6 +114,14 @@ then prepare your first edition.
 
 ```bash
 pnpm tauri build     # produces unsigned host-native bundle(s) under src-tauri/target/release/bundle
+```
+
+To make a release-candidate checksum manifest, pass its exact artifact paths to the cross-platform
+generator. Keep the manifest with the candidate; checksums establish file identity, not signing or
+platform trust.
+
+```bash
+pnpm artifacts:checksums -- --output SHA256SUMS.txt path/to/artifact-one path/to/artifact-two
 ```
 
 ## Validation

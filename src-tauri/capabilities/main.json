@@ -3,5 +3,5 @@
   "identifier": "main",
   "description": "Least-privilege capability for the local presentation window",
   "windows": ["main"],
-  "permissions": []
+  "permissions": ["core:webview:allow-set-webview-zoom"]
 }

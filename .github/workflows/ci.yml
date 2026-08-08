@@ -35,6 +35,12 @@ jobs:
         with:
           workspaces: src-tauri
       - run: pnpm install --frozen-lockfile
+      - name: Audit JavaScript dependencies
+        run: pnpm audit --audit-level=high
+      - name: Install Rust advisory scanner
+        run: cargo install cargo-audit --locked
+      - name: Audit Rust dependencies
+        run: cargo audit --file src-tauri/Cargo.lock
       - run: pnpm verify
       - name: Compile the host desktop binary
         run: pnpm tauri build --ci --no-bundle -- --locked
