@@ -32,10 +32,16 @@ jobs:
             if ($vs) { $paths += "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"; $paths += "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja" }
           }
           $paths | Where-Object { Test-Path $_ } | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          'AGENT_TOOLSDIRECTORY=C:\personal-ci\toolcache' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'DOTNET_INSTALL_DIR=C:\personal-ci\toolcache\dotnet' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libxdo-dev libssl-dev build-essential file
+      - name: Install Node required by pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
