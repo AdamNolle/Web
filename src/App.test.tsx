@@ -1030,6 +1030,9 @@ describe('calm dashboard', () => {
       new Proxy(base, {
         get(target, property, receiver) {
           if (property === 'importArchive') return importArchive;
+          if (property === 'getDashboard')
+            return async () =>
+              received ? structuredClone(importedDashboard) : target.getDashboard();
           return Reflect.get(target, property, receiver);
         },
       }) as AppTransport,
@@ -1060,8 +1063,10 @@ describe('calm dashboard', () => {
     expect(screen.getByText('Manual re-import only')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Activity' }));
-    const archiveHealthRow = await screen.findByRole('row', { name: /Family Instagram archive/ });
-    expect(within(archiveHealthRow).getByText('Manual re-import only')).toBeInTheDocument();
+    await waitFor(() => {
+      const archiveHealthRow = screen.getByRole('row', { name: /Family Instagram archive/ });
+      expect(within(archiveHealthRow).getByText('Manual re-import only')).toBeInTheDocument();
+    });
   });
 
   it('retains only failed reviewed feeds for accessible edit and retry', async () => {
