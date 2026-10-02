@@ -14,7 +14,8 @@ env:
 
 jobs:
   verify:
-    timeout-minutes: 30
+    # Cold Windows builds compile separate test, all-feature Clippy, and release profiles.
+    timeout-minutes: ${{ startsWith(matrix.os, 'windows-') && 90 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +47,8 @@ jobs:
           $tools = Join-Path (Split-Path $env:RUNNER_TEMP -Parent) '_tool'
           "CARGO_HOME=$tools\cargo" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RUSTUP_HOME=$tools\rustup" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'CARGO_BUILD_JOBS=2' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'CMAKE_BUILD_PARALLEL_LEVEL=2' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "$tools\cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux desktop dependencies

@@ -1133,7 +1133,7 @@ describe('calm dashboard', () => {
     await user.type(query, 'local');
     await user.click(screen.getByRole('button', { name: 'Search' }));
     await screen.findByText(/local matches\./);
-    expect(screen.getByText(/From the search field, press Down Arrow/)).toBeInTheDocument();
+    expect(await screen.findByText(/From the search field, press Down Arrow/)).toBeInTheDocument();
 
     query.focus();
     await user.keyboard('{ArrowDown}');

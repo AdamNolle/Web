@@ -15,6 +15,8 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
+    // The personal Windows VM serves several runners concurrently.
+    maxWorkers: process.env.CI && process.platform === 'win32' ? 1 : undefined,
     setupFiles: ['./src/test/setup.ts'],
     css: true,
   },
